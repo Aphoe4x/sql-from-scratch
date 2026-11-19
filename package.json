@@ -1,0 +1,11 @@
+{
+  "name": "sql-from-scratch",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "demo": "node src/main.mjs",
+    "crashtest": "node src/crashtest.mjs"
+  },
+  "engines": { "node": ">=18" }
+}
