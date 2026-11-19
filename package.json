@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "demo": "node src/main.mjs",
-    "crashtest": "node src/crashtest.mjs"
+    "crashtest": "node src/crashtest.mjs",
+    "test": "node src/smoke_fs.mjs && node src/smoke_btree.mjs && node src/smoke_engine.mjs"
   },
   "engines": { "node": ">=18" }
 }
