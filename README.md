@@ -3,17 +3,41 @@
 A SQL database written from scratch — no dependencies, no external services, running on plain Node.js.
 
 ```
+npm run cli               # interactive SQL shell (creates ./cli.db)
 npm run demo              # seed 1000 users + 3 SELECT queries with planner output
 npm run crashtest         # SIGKILL mid-transaction: recovery verification
-npm run test              # smoke tests (file manager, B-tree, SQL engine)
+npm run test              # smoke tests (file manager, B-tree, SQL engine, ...)
 node src/smoke_fs.mjs     # FileManager unit smoke
 node src/smoke_btree.mjs  # B-tree unit smoke (7000 entries)
 node src/smoke_engine.mjs # SQL engine end-to-end (create/insert/query/reopen)
 node src/smoke_dml.mjs    # UPDATE + DELETE smoke (merge-based rebalance, delete stress)
-node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / AND-chains smoke
+node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / DISTINCT
 node src/smoke_joins.mjs  # INNER / LEFT / comma joins, qualified names, joins + GROUP BY
 node src/smoke_indexes.mjs # CREATE INDEX, index maintenance on DML, reopen, LIMIT/OFFSET
+node src/smoke_cli.mjs    # interactive shell in piped mode
 ```
+
+## Try it in a shell
+
+```text
+$ npm run cli -- demo.db --plan
+sql> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+OK
+sql> INSERT INTO users (name) VALUES ('ada');
+inserted key 1
+sql> SELECT * FROM users;
++----+------+
+| id | name |
++----+------+
+| 1  | ada  |
++----+------+
+1 row
+sql> .schema
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);  -- 1 rows
+sql> .exit
+```
+
+Piped input works too: `echo "SELECT COUNT(*) FROM users;" | node src/cli.mjs demo.db`.
 
 ## What it is
 
@@ -28,6 +52,7 @@ node src/smoke_indexes.mjs # CREATE INDEX, index maintenance on DML, reopen, LIM
 | Joins | `INNER` / `LEFT` / comma cross joins, aliases, qualified columns, joins + GROUP BY |
 | Indexes | `CREATE INDEX name ON t (column)` — hash-keyed secondary B-trees, maintained on INSERT/UPDATE/DELETE, persisted in the meta page |
 | `src/main.mjs` | Demo: seed + selects. |
+| `src/cli.mjs` | Interactive SQL shell (`.tables`, `.schema`, `.plan`, `.exit`). |
 | `src/crashtest.mjs` + `src/crashtest_child.mjs` | Crash-recovery test (see below). |
 
 ## SQL subset
@@ -68,6 +93,7 @@ CREATE INDEX idx_users_name ON users (name)
 SELECT id FROM users WHERE name = 'user-5'      -- planner: secondary-index-seek
 SELECT id FROM users ORDER BY id ASC LIMIT 5 OFFSET 10
 SELECT city, COUNT(*) AS n FROM users GROUP BY city ORDER BY n DESC LIMIT 2
+SELECT DISTINCT city FROM users ORDER BY city       -- duplicate rows removed before ORDER BY/LIMIT
 ```
 
 Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree key, other columns are typed-encoded values (int = 8-byte double, text = len + bytes).
