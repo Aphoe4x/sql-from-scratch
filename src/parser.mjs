@@ -31,8 +31,18 @@ export function parse(sql) {
     return t.value;
   };
 
-  const parseCreateTable = () => {
+  const parseCreate = () => {
     expect('CREATE');
+    if (isKeyword(peek(), 'INDEX')) {
+      expect('INDEX');
+      const name = ident();
+      expect('ON');
+      const table = ident();
+      expect(null, '(');
+      const column = ident();
+      expect(null, ')');
+      return { type: 'createIndex', name, table, column };
+    }
     expect('TABLE');
     const name = ident();
     expect(null, '(');
@@ -316,11 +326,22 @@ export function parse(sql) {
     const having = parseHaving();
     const orderByKeys = parseOrderBy();
     const orderBy = orderByKeys ? orderByKeys[0] : null;
-    return { type: 'select', table: from.table, from, joins, selectItems, where, groupBy, having, orderBy, orderByKeys };
+    let limit = null;
+    let offset = 0;
+    if (isKeyword(peek(), 'LIMIT')) {
+      expect('LIMIT');
+      limit = literal();
+      if (isKeyword(peek(), 'OFFSET')) {
+        expect('OFFSET');
+        offset = literal();
+      }
+    }
+    if (typeof limit === 'number' && (!Number.isInteger(limit) || limit < 0)) throw new Error('parse: LIMIT must be a non-negative integer');
+    return { type: 'select', table: from.table, from, joins, selectItems, where, groupBy, having, orderBy, orderByKeys, limit, offset };
   };
 
   const t = peek();
-  if (isWord(t, 'CREATE')) return parseCreateTable();
+  if (isWord(t, 'CREATE')) return parseCreate();
   if (isWord(t, 'INSERT')) return parseInsert();
   if (isWord(t, 'UPDATE')) return parseUpdate();
   if (isWord(t, 'DELETE')) return parseDelete();

@@ -16,6 +16,35 @@ const bareName = (name) => {
   return dot > 0 ? name.slice(dot + 1) : name;
 };
 
+/**
+ * Secondary indexes are B-trees keyed by a 32-bit hash of the column value,
+ * because B-tree keys are u32. A hash collision just means a bucket with
+ * several row ids — lookups re-check the real column value, so correctness
+ * never depends on the hash being collision-free.
+ */
+export function hashValue(v) {
+  const s = typeof v === 'number' ? `n:${v}` : `s:${v === undefined ? '' : String(v)}`;
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** Index entry payload: [count u32][rowId u32 ...]. */
+const decodeBucket = (buf) => {
+  if (!buf || buf.length < 4) return [];
+  const n = buf.readUInt32LE(0);
+  return Array.from({ length: n }, (_, i) => buf.readUInt32LE(4 + 4 * i));
+};
+const encodeBucket = (ids) => {
+  const b = Buffer.alloc(4 + 4 * ids.length);
+  b.writeUInt32LE(ids.length, 0);
+  ids.forEach((id, i) => b.writeUInt32LE(id, 4 + 4 * i));
+  return b;
+};
+
 /** Evaluate one WHERE/HAVING condition, reading values through `getVal(name)`. */
 function conditionMatches(cond, getVal) {
   const actual = getVal(cond.col);
@@ -100,7 +129,8 @@ export class Database {
   static open(filePath) {
     const db = new Database(FileManager.open(filePath));
     for (const t of db.fm.tables) {
-      db.tables.set(t.name, { name: t.name, columns: t.columns, rootPage: t.rootPage, nextId: t.nextId, committedRootPage: t.rootPage, committedNextId: t.nextId, bt: new BTree(db.fm, t.rootPage) });
+      const indexes = (t.indexes ?? []).map((ix) => ({ ...ix, committedRootPage: ix.rootPage, bt: new BTree(db.fm, ix.rootPage) }));
+      db.tables.set(t.name, { name: t.name, columns: t.columns, rootPage: t.rootPage, nextId: t.nextId, committedRootPage: t.rootPage, committedNextId: t.nextId, indexes, bt: new BTree(db.fm, t.rootPage) });
     }
     return db;
   }
@@ -110,13 +140,56 @@ export class Database {
   }
 
   createTable(name, columns) {
+    const keyCol = columns.find((c) => c.isKey) ?? columns[0];
+    // B-tree keys are u32, so the row key must be an INTEGER column.
+    if (!keyCol || keyCol.type !== 'INTEGER') throw new Error(`createTable: key column of '${name}' must be INTEGER`);
     const rootPage = this.fm.allocatePage();
     this.fm.writePage(rootPage, serializeLeaf({ type: LEAF, pageNum: rootPage, entries: [] }));
-    const table = { name, columns, rootPage, nextId: 1, committedRootPage: rootPage, committedNextId: 1, bt: new BTree(this.fm, rootPage) };
+    const table = { name, columns, rootPage, nextId: 1, committedRootPage: rootPage, committedNextId: 1, indexes: [], bt: new BTree(this.fm, rootPage) };
     this.tables.set(name, table);
-    this.fm.tables.push({ name, columns, rootPage, nextId: 1 });
+    this.fm.tables.push({ name, columns, rootPage, nextId: 1, indexes: [] });
     this.fm.writeMeta();
     return table;
+  }
+
+  /**
+   * CREATE INDEX name ON table (column) — builds a secondary B-tree over every
+   * existing row. Index entries map hash(value) -> [rowId...].
+   */
+  createIndex(tableName, column, name = null) {
+    const table = this.tables.get(tableName);
+    if (!table) throw new Error(`createIndex: no such table '${tableName}'`);
+    if (!table.columns.some((c) => c.name === column)) throw new Error(`createIndex: no column '${column}' on '${tableName}'`);
+    const idxName = name ?? `idx_${tableName}_${column}`;
+    if (table.indexes.some((ix) => ix.name === idxName)) throw new Error(`createIndex: '${idxName}' already exists`);
+    const rootPage = this.fm.allocatePage();
+    this.fm.writePage(rootPage, serializeLeaf({ type: LEAF, pageNum: rootPage, entries: [] }));
+    const idx = { name: idxName, column, rootPage, committedRootPage: rootPage, bt: new BTree(this.fm, rootPage) };
+    for (const { key, value } of table.bt.scan(null)) {
+      this.indexAdd(idx, this.queryRow(table, key, value)[column], key);
+    }
+    table.indexes.push(idx);
+    this.fm.writeMeta();
+    return idx;
+  }
+
+  indexAdd(idx, value, rowId) {
+    const h = hashValue(value);
+    const found = idx.bt.find(h);
+    const ids = found.found ? decodeBucket(found.value) : [];
+    if (!ids.includes(rowId)) ids.push(rowId);
+    idx.bt.insert(h, encodeBucket(ids));
+    idx.rootPage = idx.bt.rootPage;
+  }
+
+  indexRemove(idx, value, rowId) {
+    const h = hashValue(value);
+    const found = idx.bt.find(h);
+    if (!found.found) return;
+    const ids = decodeBucket(found.value).filter((id) => id !== rowId);
+    if (ids.length) idx.bt.insert(h, encodeBucket(ids));
+    else idx.bt.delete(h);
+    idx.rootPage = idx.bt.rootPage;
   }
 
   insert(tableName, row) {
@@ -128,6 +201,7 @@ export class Database {
     else table.nextId = Math.max(table.nextId, key + 1);
     table.bt.insert(key, encodeValue(table, row));
     table.rootPage = table.bt.rootPage; // may have moved after root splits
+    for (const ix of table.indexes) this.indexAdd(ix, row[ix.column], key);
     // NOTE: meta page is synced on commit, not per-insert.
     return key;
   }
@@ -140,9 +214,11 @@ export class Database {
     if (meta) {
       meta.rootPage = table.rootPage;
       meta.nextId = table.nextId;
+      meta.indexes = table.indexes.map((ix) => ({ name: ix.name, column: ix.column, rootPage: ix.rootPage }));
     }
     table.committedRootPage = table.rootPage;
     table.committedNextId = table.nextId;
+    for (const ix of table.indexes) ix.committedRootPage = ix.rootPage;
   }
 
   /**
@@ -205,9 +281,40 @@ export class Database {
   }
 
   /**
+   * Read the rows of one table, using a secondary index when the WHERE clause
+   * has an equality on an indexed column (other conditions still apply).
+   */
+  scanRows(table, where, alias = null) {
+    // Resolve `col` and `alias.col` against a plain row of this table.
+    const getter = (row) => (name) => {
+      if (!name.includes('.')) return row[name];
+      const a = name.slice(0, name.indexOf('.'));
+      return alias && a === alias ? row[bareName(name)] : undefined;
+    };
+    const eq = where?.conditions.find((c) => c.op === '=' && c.valueCol === undefined && (!c.col.includes('.') || (alias && c.col.slice(0, c.col.indexOf('.')) === alias)));
+    if (eq) {
+      const col = bareName(eq.col);
+      const idx = (table.indexes ?? []).find((ix) => ix.column === col);
+      if (idx) {
+        const found = idx.bt.find(hashValue(eq.value));
+        const rows = [];
+        for (const id of found.found ? decodeBucket(found.value) : []) {
+          const e = table.bt.find(id);
+          if (!e.found) continue;
+          const row = this.queryRow(table, id, e.value);
+          if (matchesWhere(where, getter(row))) rows.push(row);
+        }
+        return { rows, usedIndex: idx.name };
+      }
+    }
+    const filter = where ? (key, value) => matchesWhere(where, getter(this.queryRow(table, key, value))) : null;
+    return { rows: [...table.bt.scan(filter)].map((e) => this.queryRow(table, e.key, e.value)), usedIndex: null };
+  }
+
+  /**
    * SELECT execution: nested-loop joins (INNER / LEFT / comma-cross), grouping,
-   * aggregates, HAVING and ORDER BY.
-   * AST shape: { table, from, joins, selectItems, where, groupBy, having, orderBy }.
+   * aggregates, HAVING, ORDER BY and LIMIT/OFFSET.
+   * AST shape: { table, from, joins, selectItems, where, groupBy, having, orderBy, limit, offset }.
    */
   execSelect(ast) {
     const from = ast.from ?? { table: ast.table, alias: null };
@@ -223,8 +330,12 @@ export class Database {
 
     const rowsOf = (t) => [...t.bt.scan(null)].map((e) => this.queryRow(t, e.key, e.value));
 
+    // Single-table reads can use a secondary index for equality predicates.
+    const singleTable = sources.length === 1;
+    const baseRows = singleTable ? this.scanRows(base, ast.where, sources[0].alias).rows : rowsOf(base);
+
     // Nested-loop join: start with the base rows, then multiply by each join source.
-    let joined = rowsOf(base).map((r) => ({ [sources[0].alias]: r }));
+    let joined = baseRows.map((r) => ({ [sources[0].alias]: r }));
     for (let si = 1; si < sources.length; si++) {
       const src = sources[si];
       const other = rowsOf(src.table);
@@ -248,7 +359,7 @@ export class Database {
 
     const get = (row, name) => this.resolveCol(row, name);
 
-    const rows = ast.where
+    const rows = !singleTable && ast.where
       ? joined.filter((row) => matchesWhere(ast.where, (name) => get(row, name)))
       : joined;
 
@@ -269,6 +380,8 @@ export class Database {
     //  - otherwise                   -> one singleton group per row
     const hasAgg = ast.selectItems.some((i) => i.kind === 'agg');
     const groups = new Map();
+    // Aggregates without GROUP BY always produce exactly one row, even over zero rows.
+    if (hasAgg && !ast.groupBy) groups.set('__all__', { row: {}, rows: [] });
     let gid = 0;
     for (const row of rows) {
       const gkey = ast.groupBy
@@ -340,7 +453,7 @@ export class Database {
       if (item.kind === 'col') return [item.alias ?? bareName(item.name)];
       return [item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`];
     });
-    return { rows: entries.map((e) => e.out), columns };
+    return { rows: entries.slice(ast.offset ?? 0, ast.limit != null ? (ast.offset ?? 0) + ast.limit : undefined).map((e) => e.out), columns };
   }
 
   query(tableName, { where = null, orderBy = null, columns = null } = {}) {
@@ -373,8 +486,19 @@ export class Database {
         rowsEstimate: jstats.reduce((a, s) => a * s.entryCount, stats.entryCount),
       };
     }
-    if (ast.where) return { strategy: 'index-seek', pages: stats.depth + 1, rowsEstimate: 1 };
-    return { strategy: 'full-scan', pages: stats.pageCount, rowsEstimate: stats.entryCount };
+    if (!ast.where) return { strategy: 'full-scan', pages: stats.pageCount, rowsEstimate: stats.entryCount };
+    const eq = ast.where.conditions.find((c) => c.op === '=' && c.valueCol === undefined);
+    if (eq) {
+      const col = bareName(eq.col);
+      if (col === this.keyColumnOf(table).name) return { strategy: 'index-seek', pages: stats.depth + 1, rowsEstimate: 1 };
+      const idx = (table.indexes ?? []).find((ix) => ix.column === col);
+      if (idx) {
+        const istats = idx.bt.stats();
+        return { strategy: 'secondary-index-seek', pages: istats.depth + 1, rowsEstimate: 1 };
+      }
+    }
+    // Filtered scan: still reads every leaf page, but only keeps matching rows.
+    return { strategy: 'full-scan', pages: stats.pageCount, rowsEstimate: stats.entryCount, filtered: true };
   }
 
   execSql(sql) {
@@ -383,6 +507,11 @@ export class Database {
       this.createTable(ast.name, ast.columns);
       this.commit(); // DDL is committed eagerly
       return { rows: [], columns: [], plan: null };
+    }
+    if (ast.type === 'createIndex') {
+      this.createIndex(ast.table, ast.column, ast.name);
+      this.commit();
+      return { rows: [], columns: [], plan: null, index: ast.name ?? `idx_${ast.table}_${ast.column}` };
     }
     if (ast.type === 'insert') {
       const key = this.insert(ast.table, this.mapRow(ast));
@@ -426,8 +555,15 @@ export class Database {
     const filter = this.buildFilter(table, where);
     let updated = 0;
     for (const { key, value } of table.bt.scan(filter)) {
-      const newRow = { ...this.queryRow(table, key, value), ...Object.fromEntries(sets.map((s) => [s.col, s.value])) };
+      const oldRow = this.queryRow(table, key, value);
+      const newRow = { ...oldRow, ...Object.fromEntries(sets.map((s) => [s.col, s.value])) };
       if (!table.bt.update(key, encodeValue(table, newRow))) throw new Error(`update: key ${key} not found`);
+      for (const ix of table.indexes) {
+        if (oldRow[ix.column] !== newRow[ix.column]) {
+          this.indexRemove(ix, oldRow[ix.column], key);
+          this.indexAdd(ix, newRow[ix.column], key);
+        }
+      }
       updated++;
     }
     return updated;
@@ -444,6 +580,10 @@ export class Database {
     const keys = [...table.bt.scan(filter)].map((e) => e.key);
     let deleted = 0;
     for (const key of keys) {
+      const e = table.bt.find(key);
+      if (!e.found) continue;
+      const row = this.queryRow(table, key, e.value);
+      for (const ix of table.indexes) this.indexRemove(ix, row[ix.column], key);
       if (table.bt.delete(key)) deleted++;
     }
     return deleted;
@@ -463,6 +603,10 @@ export class Database {
       table.rootPage = table.committedRootPage;
       table.nextId = table.committedNextId;
       table.bt = new BTree(this.fm, table.rootPage);
+      for (const ix of table.indexes) {
+        ix.rootPage = ix.committedRootPage;
+        ix.bt = new BTree(this.fm, ix.rootPage);
+      }
     }
   }
 }

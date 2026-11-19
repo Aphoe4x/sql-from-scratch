@@ -8,10 +8,11 @@ const [, , dbPath, markerPath] = process.argv;
 const db = Database.open(dbPath);
 
 db.execSql("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)");
-// Committed transaction: 100 rows.
+// Committed transaction: 100 rows, plus a secondary index over them.
 for (let i = 1; i <= 100; i++) {
   db.execSql(`INSERT INTO users (name) VALUES ('seed-${i}')`);
 }
+db.execSql('CREATE INDEX idx_users_name ON users (name)');
 
 // Uncommitted transaction: 50 rows. Marker signals the parent, then we stall.
 db.begin();

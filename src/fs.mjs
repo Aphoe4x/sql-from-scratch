@@ -10,7 +10,7 @@ export const INTERNAL = 0;
 export const LEAF = 1;
 
 const MAGIC = 0x535144; // "SQD"
-const VERSION = 1;
+const VERSION = 2; // v2 adds the per-table secondary-index directory
 
 // ---- page serialization helpers -------------------------------------------
 
@@ -104,6 +104,11 @@ export class FileManager {
     return new FileManager(filePath);
   }
 
+  close() {
+    fs.closeSync(this.fd);
+    fs.closeSync(this.walFd);
+  }
+
   // ---- meta page -----------------------------------------------------------
 
   writeMeta() {
@@ -117,14 +122,14 @@ export class FileManager {
     for (const t of this.tables) {
       buf.writeUInt32LE(t.name.length, off);
       off += 4;
-      buf.write(t.name, 'utf8');
+      buf.write(t.name, off, 'utf8');
       off += t.name.length;
       buf.writeUInt32LE(t.columns.length, off);
       off += 4;
       for (const c of t.columns) {
         buf.writeUInt32LE(c.name.length, off);
         off += 4;
-        buf.write(c.name, 'utf8');
+        buf.write(c.name, off, 'utf8');
         off += c.name.length;
         buf[off] = c.type === 'integer' ? 0 : 1;
         off += 1;
@@ -135,6 +140,21 @@ export class FileManager {
       off += 4;
       buf.writeUInt32LE(t.nextId, off);
       off += 4;
+      const indexes = t.indexes ?? [];
+      buf.writeUInt32LE(indexes.length, off);
+      off += 4;
+      for (const ix of indexes) {
+        buf.writeUInt32LE(ix.name.length, off);
+        off += 4;
+        buf.write(ix.name, off, 'utf8');
+        off += ix.name.length;
+        buf.writeUInt32LE(ix.column.length, off);
+        off += 4;
+        buf.write(ix.column, off, 'utf8');
+        off += ix.column.length;
+        buf.writeUInt32LE(ix.rootPage, off);
+        off += 4;
+      }
     }
     fs.writeSync(this.fd, buf, 0, PAGE_SIZE, 0);
     fs.fsyncSync(this.fd);
@@ -144,6 +164,7 @@ export class FileManager {
     const buf = Buffer.alloc(PAGE_SIZE);
     fs.readSync(this.fd, buf, 0, PAGE_SIZE, 0);
     if (buf.readUInt32LE(0) !== MAGIC) throw new Error(`corrupt meta page in ${this.path}`);
+    const version = buf.readUInt32LE(4);
     this.pageCount = buf.readUInt32LE(8);
     this.lastCommitLSN = buf.readUInt32LE(12);
     this.tables = [];
@@ -172,7 +193,26 @@ export class FileManager {
       off += 4;
       const nextId = buf.readUInt32LE(off);
       off += 4;
-      this.tables.push({ name, columns, rootPage, nextId });
+      // v1 files have no index directory.
+      const indexes = [];
+      if (version >= 2) {
+        const nIdx = buf.readUInt32LE(off);
+        off += 4;
+        for (let k = 0; k < nIdx; k++) {
+          const ixNameLen = buf.readUInt32LE(off);
+          off += 4;
+          const ixName = buf.slice(off, off + ixNameLen).toString('utf8');
+          off += ixNameLen;
+          const colLen = buf.readUInt32LE(off);
+          off += 4;
+          const column = buf.slice(off, off + colLen).toString('utf8');
+          off += colLen;
+          const ixRoot = buf.readUInt32LE(off);
+          off += 4;
+          indexes.push({ name: ixName, column, rootPage: ixRoot });
+        }
+      }
+      this.tables.push({ name, columns, rootPage, nextId, indexes });
     }
   }
 
