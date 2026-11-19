@@ -212,6 +212,7 @@ export class FileManager {
     fs.fsyncSync(this.fd);
     this.dirty.clear();
     this.lastCommitLSN = this.walAppend(WAL_TYPE_COMMIT, {});
+    this.writeMeta();
   }
 
   /** Drop all staged (uncommitted) changes. */
