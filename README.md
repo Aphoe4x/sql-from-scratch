@@ -11,6 +11,7 @@ node src/smoke_btree.mjs  # B-tree unit smoke (7000 entries)
 node src/smoke_engine.mjs # SQL engine end-to-end (create/insert/query/reopen)
 node src/smoke_dml.mjs    # UPDATE + DELETE smoke (merge-based rebalance, delete stress)
 node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / AND-chains smoke
+node src/smoke_joins.mjs  # INNER / LEFT / comma joins, qualified names, joins + GROUP BY
 ```
 
 ## What it is
@@ -21,8 +22,9 @@ node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / 
 | `src/btree.mjs` | Classic bottom-up **B-tree** over the pages: `find` / `insert` / `scan` / `stats`. |
 | `src/engine.mjs` | **SQL facade**: `Database.create/open/execSql/query/insert/commit/rollback`. |
 | `src/lexer.mjs` / `src/parser.mjs` | SQL lexer + parser for the subset below. |
-| `src/planner.mjs` | Static planner with real cost estimates (pages touched). |
+| `src/planner.mjs` | Static planner with real cost estimates (pages touched); knows full-scan, index-seek and nested-loop-join. |
 | DML | `UPDATE t SET col = v [WHERE c = v]` · `DELETE FROM t [WHERE c = v]` |
+| Joins | `INNER` / `LEFT` / comma cross joins, aliases, qualified columns, joins + GROUP BY |
 | `src/main.mjs` | Demo: seed + selects. |
 | `src/crashtest.mjs` + `src/crashtest_child.mjs` | Crash-recovery test (see below). |
 
@@ -50,6 +52,14 @@ SELECT id FROM sales WHERE amount BETWEEN 50 AND 150
 SELECT id FROM sales WHERE city <> 'Lagos'
 SELECT city, COUNT(*) AS n, SUM(amount) AS total FROM sales GROUP BY city ORDER BY city
 SELECT city, COUNT(*) AS n FROM sales GROUP BY city HAVING n > 4
+
+-- Joins (customers c, orders o):
+SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id
+SELECT c.name, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+SELECT c.name, o.id FROM customers c, orders o WHERE c.id = o.customer_id   -- comma = cross join
+SELECT c.name, COUNT(*) AS n FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.name
+SELECT c.* FROM customers c WHERE c.id = 1        -- qualified star
+SELECT c.name, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id ORDER BY o.id DESC, c.name
 ```
 
 Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree key, other columns are typed-encoded values (int = 8-byte double, text = len + bytes).
@@ -80,6 +90,9 @@ Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree k
 ## Limitations (intended scope)
 
 - Single connection (no locking).
-- No updates/deletes, no GROUP BY/JOINs/aggregates yet.
+- No subqueries, UNION, RIGHT/FULL OUTER JOIN, window functions, or indexes other than the primary-key B-tree.
+- JOINs are nested-loop (no hash/merge join); the planner reports `nested-loop-join` with a pages/rows estimate but does not reorder joins.
+- Unqualified column names in a join resolve to the first table in FROM order; qualify (`o.id`) when both sides have the same column name.
+- Comparison operands may be literals or columns; `BETWEEN` takes literals only.
 - Values fit in `text`/`double` encodings; no dates/blobs/NULLs (use `''`/0).
 - The engine is a library + CLI demos; deployment isn't the point — the point is "shipped a working storage engine from scratch".
