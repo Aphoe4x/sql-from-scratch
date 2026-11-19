@@ -10,6 +10,7 @@ node src/smoke_fs.mjs     # FileManager unit smoke
 node src/smoke_btree.mjs  # B-tree unit smoke (7000 entries)
 node src/smoke_engine.mjs # SQL engine end-to-end (create/insert/query/reopen)
 node src/smoke_dml.mjs    # UPDATE + DELETE smoke (merge-based rebalance, delete stress)
+node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / AND-chains smoke
 ```
 
 ## What it is
@@ -40,6 +41,15 @@ UPDATE users SET name = 'renamed-5' WHERE id = 5
 UPDATE users SET name = 'all-same'            -- no WHERE = every row
 DELETE FROM users WHERE id = 7
 DELETE FROM users                             -- truncate the table
+
+-- Aggregates, GROUP BY, HAVING (on a table with `city`, `amount`):
+SELECT COUNT(*) FROM sales
+SELECT SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM sales
+SELECT id FROM sales WHERE amount >= 50 AND amount < 100      -- AND chains
+SELECT id FROM sales WHERE amount BETWEEN 50 AND 150
+SELECT id FROM sales WHERE city <> 'Lagos'
+SELECT city, COUNT(*) AS n, SUM(amount) AS total FROM sales GROUP BY city ORDER BY city
+SELECT city, COUNT(*) AS n FROM sales GROUP BY city HAVING n > 4
 ```
 
 Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree key, other columns are typed-encoded values (int = 8-byte double, text = len + bytes).
