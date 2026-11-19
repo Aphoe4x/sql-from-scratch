@@ -6,6 +6,7 @@ A SQL database written from scratch — no dependencies, no external services, r
 npm run cli               # interactive SQL shell (creates ./cli.db)
 npm run demo              # seed 1000 users + 3 SELECT queries with planner output
 npm run crashtest         # SIGKILL mid-transaction: recovery verification
+npm run crashtest2        # SIGKILL *inside commit*: WAL redo verification
 npm run test              # smoke tests (file manager, B-tree, SQL engine, ...)
 node src/smoke_fs.mjs     # FileManager unit smoke
 node src/smoke_btree.mjs  # B-tree unit smoke (7000 entries)
@@ -15,6 +16,7 @@ node src/smoke_aggregates.mjs # aggregates / GROUP BY / HAVING / BETWEEN / <> / 
 node src/smoke_joins.mjs  # INNER / LEFT / comma joins, qualified names, joins + GROUP BY
 node src/smoke_indexes.mjs # CREATE INDEX, index maintenance on DML, reopen, LIMIT/OFFSET
 node src/smoke_cli.mjs    # interactive shell in piped mode
+node src/smoke_freelist.mjs # page reuse after deletes + checksum corruption detection
 ```
 
 ## Try it in a shell
@@ -43,7 +45,7 @@ Piped input works too: `echo "SELECT COUNT(*) FROM users;" | node src/cli.mjs de
 
 | File | What |
 |---|---|
-| `src/fs.mjs` | **FileManager** — the disk: real OS file of 4096-byte pages. Meta page 0, write-ahead log (`<db>.wal`). |
+| `src/fs.mjs` | **FileManager** — the disk: real OS file of 4096-byte pages. Meta page 0, page checksums, freelist, write-ahead log (`<db>.wal`). |
 | `src/btree.mjs` | Classic bottom-up **B-tree** over the pages: `find` / `insert` / `scan` / `stats`. |
 | `src/engine.mjs` | **SQL facade**: `Database.create/open/execSql/query/insert/commit/rollback`. |
 | `src/lexer.mjs` / `src/parser.mjs` | SQL lexer + parser for the subset below. |
@@ -54,6 +56,7 @@ Piped input works too: `echo "SELECT COUNT(*) FROM users;" | node src/cli.mjs de
 | `src/main.mjs` | Demo: seed + selects. |
 | `src/cli.mjs` | Interactive SQL shell (`.tables`, `.schema`, `.plan`, `.exit`). |
 | `src/crashtest.mjs` + `src/crashtest_child.mjs` | Crash-recovery test (see below). |
+| `src/crashtest2.mjs` + `src/crashcommit_child.mjs` | Crash-**inside-commit** test (WAL redo + partial page apply). |
 
 ## SQL subset
 
@@ -100,8 +103,8 @@ Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree k
 
 ## Storage layout
 
-- **Page 0** — meta page (format v2): magic, version, pageCount, lastCommitLSN, table directory (name, columns, rootPage, nextId, secondary indexes: name/column/rootPage).
-- **Pages 1..** — B-tree pages:
+- **Page 0** — meta page (format v3): magic, version, pageCount, lastCommitLSN, table directory (name, columns, rootPage, nextId, secondary indexes: name/column/rootPage), freelist (reusable page numbers), trailing CRC-32.
+- **Pages 1..** — B-tree pages (every page ends with a CRC-32 of the rest of the page):
   - internal: `[type u32][n seps][n+1 children]` (`seps.length + 1 == children.length`)
   - leaf: `[type u32][count u32][key u32, valueLen u16, value][...]`
   - Invariant: `children[i]` holds keys in `(seps[i-1], seps[i]]`, `children[0] = keys ≤ seps[0]`, `children[n] = keys > seps[n-1]`.
@@ -110,8 +113,16 @@ Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree k
 ## Transactions
 
 - `db.execSql("INSERT ...")` — auto-commit.
-- `db.begin(); db.insert(...); db.commit()` — `commit()` flushes dirty pages to the file, appends a COMMIT record and fsyncs.
+- `db.begin(); db.insert(...); db.commit()` — commits a group of statements atomically.
 - `db.rollback()` — discards staged pages; the engine resets each tree to its last committed root (in-memory tree must match the file).
+
+Commit protocol (write-ahead, in this order):
+
+1. Stage every dirty page **plus the meta page 0** as WAL PAGE records, append a COMMIT record, `fsync` the WAL.
+2. Apply the pages to the database file, `fsync` it.
+3. Checkpoint: truncate the WAL (the file is durable).
+
+A crash before step 1 discards everything; a crash after it replays the committed pages on open. Because the table directory, `pageCount` and the freelist live in page 0, they are crash-atomic with the data pages.
 
 ## Crash recovery (`Database.open`)
 
@@ -120,6 +131,13 @@ Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree k
 3. Truncates the WAL to zero.
 
 `node src/crashtest.mjs`: the child seeds 100 committed rows + a committed index, opens an uncommitted tx with 50 more, the parent SIGKILLs it mid-transaction. After recovery: exactly the 100 committed rows, 0 uncommitted leakage, the secondary index still answers `WHERE name = …` (and has no entries for the uncommitted rows), and the engine is usable (a post-recovery insert lands and is indexed).
+
+`node src/crashtest2.mjs`: kills the child **inside commit**, once with the WAL durable and zero pages applied, once after one page of a partial apply. Both recover to 21 rows including the row whose commit was interrupted — the page file never held it.
+
+## Page integrity and reuse
+
+- **Checksums:** every page ends with a CRC-32 (computed with the checksum field zeroed). Reads verify it, so a torn or bit-flipped page raises `corrupt page N … checksum mismatch` instead of returning garbage. The meta page is verified on open.
+- **Freelist:** when a B-tree merge or root collapse drops a page, it goes on a freelist stored in the meta page; `allocatePage()` reuses it. In the test, deleting 1990 of 2000 rows frees 39 pages and reinserting 2000 rows grows the file by one page instead of ~20.
 
 ## Limitations (intended scope)
 
@@ -131,4 +149,6 @@ Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree k
 - Unqualified column names in a join resolve to the first table in FROM order; qualify (`o.id`) when both sides have the same column name.
 - Comparison operands may be literals or columns; `BETWEEN` takes literals only.
 - Values fit in `text`/`double` encodings; no dates/blobs/NULLs (use `''`/0).
+- The freelist lives in the meta page, so it holds a few hundred entries; beyond that (a single huge purge) freed pages are simply not recorded until there is room.
+- No page compaction/vacuum beyond the freelist; the WAL is checkpointed (truncated) on every commit rather than kept for point-in-time recovery.
 - The engine is a library + CLI demos; deployment isn't the point — the point is "shipped a working storage engine from scratch".
