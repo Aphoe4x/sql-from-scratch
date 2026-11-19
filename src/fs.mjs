@@ -8,9 +8,27 @@ import { crc32 } from './util.mjs';
 export const PAGE_SIZE = 4096;
 export const INTERNAL = 0;
 export const LEAF = 1;
+/** Last 4 bytes of every page hold a CRC-32 over the rest of the page. */
+const CRC_OFF = PAGE_SIZE - 4;
 
 const MAGIC = 0x535144; // "SQD"
-const VERSION = 2; // v2 adds the per-table secondary-index directory
+const VERSION = 3; // v3: page checksums + freelist in the meta page; v1/v2 files still open
+
+/** Zero the checksum field, then store the CRC of the whole page. */
+function stampCrc(buf) {
+  buf.writeUInt32LE(0, CRC_OFF);
+  buf.writeUInt32LE(crc32(buf), CRC_OFF);
+  return buf;
+}
+
+/** A stored checksum of 0 means "legacy page, not checksummed" (v1/v2 files). */
+function crcValid(buf) {
+  const stored = buf.readUInt32LE(CRC_OFF);
+  if (stored === 0) return true;
+  const copy = Buffer.from(buf);
+  copy.writeUInt32LE(0, CRC_OFF);
+  return crc32(copy) === stored;
+}
 
 // ---- page serialization helpers -------------------------------------------
 
@@ -21,7 +39,8 @@ export function serializeInternal(node) {
   buf.writeUInt32LE(node.seps.length, 4);
   node.seps.forEach((s, i) => buf.writeUInt32LE(s, 8 + 4 * i));
   node.children.forEach((c, i) => buf.writeUInt32LE(c, 8 + 4 * node.seps.length + 4 * i));
-  return buf;
+  if (8 + 4 * node.seps.length + 4 * node.children.length > CRC_OFF) throw new Error('internal page overflow');
+  return stampCrc(buf);
 }
 export function deserializeInternal(buf) {
   const n = buf.readUInt32LE(4);
@@ -44,7 +63,8 @@ export function serializeLeaf(node) {
     e.value.copy(buf, off, 0, e.value.length);
     off += e.value.length;
   }
-  return buf;
+  if (off > CRC_OFF) throw new Error('leaf page overflow');
+  return stampCrc(buf);
 }
 export function deserializeLeaf(buf) {
   const count = buf.readUInt32LE(4);
@@ -85,6 +105,9 @@ export class FileManager {
     this.lastCommitLSN = 0;
     this.tables = []; // serialized table entries (see writeMeta)
     this.dirty = new Map(); // pageNum -> Buffer, staged by writePage, flushed on commit
+    this.freeList = []; // page numbers freed by B-tree merges, reusable by allocatePage
+    this.committedFreeList = [];
+    this.committedPageCount = 1;
     this.lsn = 0; // last WAL record sequence
     this.walLen = 0;
     if (create) {
@@ -111,12 +134,13 @@ export class FileManager {
 
   // ---- meta page -----------------------------------------------------------
 
-  writeMeta() {
+  /** Serialize the meta page. `commitLsn` is the LSN this page commits under. */
+  buildMeta(commitLsn = this.lastCommitLSN) {
     const buf = Buffer.alloc(PAGE_SIZE);
     buf.writeUInt32LE(MAGIC, 0);
     buf.writeUInt32LE(VERSION, 4);
     buf.writeUInt32LE(this.pageCount, 8);
-    buf.writeUInt32LE(this.lastCommitLSN, 12);
+    buf.writeUInt32LE(commitLsn, 12);
     buf.writeUInt32LE(this.tables.length, 16);
     let off = 20;
     for (const t of this.tables) {
@@ -156,7 +180,19 @@ export class FileManager {
         off += 4;
       }
     }
-    fs.writeSync(this.fd, buf, 0, PAGE_SIZE, 0);
+    // v3: freelist of page numbers available for reuse.
+    buf.writeUInt32LE(this.freeList.length, off);
+    off += 4;
+    for (const p of this.freeList) {
+      buf.writeUInt32LE(p, off);
+      off += 4;
+    }
+    if (off > CRC_OFF) throw new Error('meta page overflow');
+    return stampCrc(buf);
+  }
+
+  writeMeta() {
+    fs.writeSync(this.fd, this.buildMeta(), 0, PAGE_SIZE, 0);
     fs.fsyncSync(this.fd);
   }
 
@@ -164,6 +200,7 @@ export class FileManager {
     const buf = Buffer.alloc(PAGE_SIZE);
     fs.readSync(this.fd, buf, 0, PAGE_SIZE, 0);
     if (buf.readUInt32LE(0) !== MAGIC) throw new Error(`corrupt meta page in ${this.path}`);
+    if (!crcValid(buf)) throw new Error(`corrupt meta page in ${this.path}: checksum mismatch`);
     const version = buf.readUInt32LE(4);
     this.pageCount = buf.readUInt32LE(8);
     this.lastCommitLSN = buf.readUInt32LE(12);
@@ -214,50 +251,102 @@ export class FileManager {
       }
       this.tables.push({ name, columns, rootPage, nextId, indexes });
     }
+    // v3: freelist.
+    this.freeList = [];
+    if (version >= 3) {
+      const nFree = buf.readUInt32LE(off);
+      off += 4;
+      for (let i = 0; i < nFree; i++) {
+        this.freeList.push(buf.readUInt32LE(off));
+        off += 4;
+      }
+    }
+    this.committedFreeList = [...this.freeList];
+    this.committedPageCount = this.pageCount;
+    this.lsn = Math.max(this.lsn, this.lastCommitLSN);
   }
 
   // ---- page I/O -------------------------------------------------------------
 
-  /** Read a page (from dirty set if staged, else from the file). */
+  /** Read a page (from dirty set if staged, else from the file). Verifies its checksum. */
   readPage(pageNum) {
     const staged = this.dirty.get(pageNum);
     if (staged) return staged;
     const buf = Buffer.alloc(PAGE_SIZE);
     fs.readSync(this.fd, buf, 0, PAGE_SIZE, pageNum * PAGE_SIZE);
+    if (!crcValid(buf)) throw new Error(`corrupt page ${pageNum} in ${this.path}: checksum mismatch`);
     return buf;
   }
 
-  /** Stage a page for the next commit. Also appends a WAL page record. */
+  /** Stage a page for the next commit. WAL records are written at commit time. */
   writePage(pageNum, buf) {
     if (buf.length !== PAGE_SIZE) throw new Error(`page buffer must be PAGE_SIZE`);
     this.dirty.set(pageNum, buf);
-    this.walAppend(WAL_TYPE_PAGE, { pageNum, data: buf });
   }
 
+  /** Take a page from the freelist, or extend the file. */
   allocatePage() {
-    const n = this.pageCount++;
-    return n;
+    while (this.freeList.length) {
+      const n = this.freeList.pop();
+      this.dirty.delete(n); // never commit stale bytes from a freed page
+      return n;
+    }
+    return this.pageCount++;
+  }
+
+  /** Mark a page as reusable (B-tree merge / root collapse). */
+  freePage(pageNum) {
+    if (pageNum === 0) return;
+    if (!this.freeList.includes(pageNum)) this.freeList.push(pageNum);
+    this.dirty.delete(pageNum);
   }
 
   // ---- commit / rollback -----------------------------------------------------
 
   /**
-   * Flush all staged pages to the file, then append a COMMIT record.
-   * Returns the commit LSN.
+   * Commit: write-ahead, then apply.
+   *  1. Append a PAGE record for every dirty page plus a meta page 0 record,
+   *     then a COMMIT record; fsync the WAL.
+   *  2. Apply all pages to the database file and fsync.
+   *  3. Checkpoint: truncate the WAL (the file is durable).
+   * A crash before (1) discards everything; a crash after it replays committed
+   * pages on open. Meta (table directory, pageCount, freelist) is page 0, so it
+   * is crash-atomic with the data pages.
    */
   commit() {
-    for (const [pageNum, buf] of [...this.dirty].sort((a, b) => a[0] - b[0])) {
+    const commitLsn = this.lsn + this.dirty.size + 2; // page records + meta record + commit
+    this.dirty.set(0, this.buildMeta(commitLsn));
+    const pages = [...this.dirty].sort((a, b) => a[0] - b[0]);
+
+    for (const [pageNum, buf] of pages) this.walAppend(WAL_TYPE_PAGE, { pageNum, data: buf });
+    const lsn = this.walAppend(WAL_TYPE_COMMIT, {});
+    fs.fsyncSync(this.walFd);
+    this.lastCommitLSN = lsn;
+
+    // Fault injection for the crash tests: die with the WAL durable but before
+    // (or partway through) applying pages to the database file.
+    if (process.env.SQDB_CRASH_AFTER_WAL) process.kill(process.pid, 'SIGKILL');
+    let applied = 0;
+    for (const [pageNum, buf] of pages) {
       fs.writeSync(this.fd, buf, 0, PAGE_SIZE, pageNum * PAGE_SIZE);
+      applied++;
+      if (process.env.SQDB_CRASH_AFTER_PAGES && applied === Number(process.env.SQDB_CRASH_AFTER_PAGES)) process.kill(process.pid, 'SIGKILL');
     }
     fs.fsyncSync(this.fd);
     this.dirty.clear();
-    this.lastCommitLSN = this.walAppend(WAL_TYPE_COMMIT, {});
-    this.writeMeta();
+
+    fs.ftruncateSync(this.walFd, 0);
+    this.walLen = 0;
+
+    this.committedFreeList = [...this.freeList];
+    this.committedPageCount = this.pageCount;
   }
 
   /** Drop all staged (uncommitted) changes. */
   rollback() {
     this.dirty.clear();
+    this.freeList = [...this.committedFreeList];
+    this.pageCount = this.committedPageCount;
   }
 
   // ---- WAL -------------------------------------------------------------------

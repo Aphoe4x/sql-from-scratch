@@ -106,6 +106,7 @@ export class BTree {
         }
         parent.seps.splice(k, 1);
         parent.children.splice(k + 1, 1);
+        this.fm.freePage(right.pageNum);
       } else if (parent.children[k - 1]) {
         // Merge the underflowed child into the left sibling.
         const left = this.read(parent.children[k - 1]);
@@ -119,6 +120,7 @@ export class BTree {
         }
         parent.seps.splice(k - 1, 1);
         parent.children.splice(k, 1);
+        this.fm.freePage(child.pageNum);
       }
       this.fm.writePage(parent.pageNum, serializeInternal(parent));
     }
@@ -126,6 +128,7 @@ export class BTree {
     // If the root is an internal page with no separators, it becomes its single child.
     const root = this.read(this.rootPage);
     if (root.type === INTERNAL && root.seps.length === 0 && root.children.length > 0) {
+      this.fm.freePage(root.pageNum);
       this.rootPage = root.children[0];
     }
     return true;

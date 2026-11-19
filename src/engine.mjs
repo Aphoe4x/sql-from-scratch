@@ -148,7 +148,7 @@ export class Database {
     const table = { name, columns, rootPage, nextId: 1, committedRootPage: rootPage, committedNextId: 1, indexes: [], bt: new BTree(this.fm, rootPage) };
     this.tables.set(name, table);
     this.fm.tables.push({ name, columns, rootPage, nextId: 1, indexes: [] });
-    this.fm.writeMeta();
+    // The meta page is committed atomically with the data pages by commit().
     return table;
   }
 
@@ -169,7 +169,6 @@ export class Database {
       this.indexAdd(idx, this.queryRow(table, key, value)[column], key);
     }
     table.indexes.push(idx);
-    this.fm.writeMeta();
     return idx;
   }
 
@@ -598,6 +597,7 @@ export class Database {
       for (const ix of table.indexes) this.indexRemove(ix, row[ix.column], key);
       if (table.bt.delete(key)) deleted++;
     }
+    table.rootPage = table.bt.rootPage; // root may collapse after merges
     return deleted;
   }
 
