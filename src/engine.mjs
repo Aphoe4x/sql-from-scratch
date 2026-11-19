@@ -453,7 +453,19 @@ export class Database {
       if (item.kind === 'col') return [item.alias ?? bareName(item.name)];
       return [item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`];
     });
-    return { rows: entries.slice(ast.offset ?? 0, ast.limit != null ? (ast.offset ?? 0) + ast.limit : undefined).map((e) => e.out), columns };
+    // DISTINCT removes duplicate output rows (after grouping, before ordering).
+    let outs = entries;
+    if (ast.distinct) {
+      const seenRows = new Set();
+      outs = entries.filter((e) => {
+        const k = JSON.stringify(e.out);
+        if (seenRows.has(k)) return false;
+        seenRows.add(k);
+        return true;
+      });
+    }
+
+    return { rows: outs.slice(ast.offset ?? 0, ast.limit != null ? (ast.offset ?? 0) + ast.limit : undefined).map((e) => e.out), columns };
   }
 
   query(tableName, { where = null, orderBy = null, columns = null } = {}) {

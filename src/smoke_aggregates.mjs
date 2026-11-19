@@ -72,4 +72,13 @@ console.log('projection ok');
 r = db.execSql('SELECT city, COUNT(city) FROM sales GROUP BY city');
 if (!r.rows.every((row) => row['count(city)'] === 5)) throw new Error(`COUNT(col): ${JSON.stringify(r.rows)}`);
 
+// 11. DISTINCT removes duplicate projected rows (before ORDER BY / LIMIT).
+r = db.execSql('SELECT DISTINCT city FROM sales ORDER BY city');
+if (r.rows.length !== 4) throw new Error(`DISTINCT city: expected 4, got ${r.rows.length}`);
+r = db.execSql('SELECT DISTINCT status FROM sales');
+if (r.rows.length !== 2) throw new Error(`DISTINCT status: expected 2, got ${r.rows.length}`);
+r = db.execSql('SELECT DISTINCT city FROM sales ORDER BY city LIMIT 2');
+if (JSON.stringify(r.rows.map((x) => x.city)) !== JSON.stringify(['Abuja', 'Ibadan'])) throw new Error(`DISTINCT + LIMIT: ${JSON.stringify(r.rows)}`);
+console.log('distinct ok');
+
 console.log('aggregates smoke OK');

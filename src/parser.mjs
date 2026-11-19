@@ -305,6 +305,11 @@ export function parse(sql) {
 
   const parseSelect = () => {
     expect('SELECT');
+    let distinct = false;
+    if (isKeyword(peek(), 'DISTINCT')) {
+      expect('DISTINCT');
+      distinct = true;
+    }
     const selectItems = [];
     if (isPunct(peek(), '*')) {
       expect(null, '*');
@@ -337,7 +342,7 @@ export function parse(sql) {
       }
     }
     if (typeof limit === 'number' && (!Number.isInteger(limit) || limit < 0)) throw new Error('parse: LIMIT must be a non-negative integer');
-    return { type: 'select', table: from.table, from, joins, selectItems, where, groupBy, having, orderBy, orderByKeys, limit, offset };
+    return { type: 'select', table: from.table, from, joins, distinct, selectItems, where, groupBy, having, orderBy, orderByKeys, limit, offset };
   };
 
   const t = peek();
