@@ -52,6 +52,85 @@ export class BTree {
     return idx === -1 ? { found: false, key, value: undefined } : { found: true, key: node.entries[idx].key, value: node.entries[idx].value };
   }
 
+  /** Replace the value of an existing key in place. Returns true if the key was found. */
+  update(key, value) {
+    let node = this.read(this.rootPage);
+    while (node.type === INTERNAL) {
+      node = this.read(node.children[this.childIndex(node, key)]);
+    }
+    const pos = node.entries.findIndex((e) => e.key === key);
+    if (pos === -1) return false;
+    node.entries[pos].value = value;
+    this.fm.writePage(node.pageNum, serializeLeaf(node));
+    return true;
+  }
+
+  /** A non-root page underflows when it's empty: leaves at 0 entries, internal pages at 0 seps. */
+  isUnderflow(node) {
+    return node.type === LEAF ? node.entries.length === 0 : node.seps.length === 0;
+  }
+
+  /**
+   * Delete a key. Returns true if it was present.
+   * Rebalance: walk up from the leaf; if a page underflowed, merge it with a
+   * sibling (parent separator moves out of the parent). Classic merge-only.
+   */
+  delete(key) {
+    const path = [];
+    let node = this.read(this.rootPage);
+    while (node.type === INTERNAL) {
+      const k = this.childIndex(node, key);
+      path.push({ node, k });
+      node = this.read(node.children[k]);
+    }
+    const pos = node.entries.findIndex((e) => e.key === key);
+    if (pos === -1) return false;
+    node.entries.splice(pos, 1);
+    this.fm.writePage(node.pageNum, serializeLeaf(node));
+
+    for (let i = path.length - 1; i >= 0; i--) {
+      const { node: parent, k } = path[i];
+      const child = this.read(parent.children[k]);
+      if (!this.isUnderflow(child)) continue;
+
+      // Merge right sibling into the underflowed child.
+      if (parent.children[k + 1]) {
+        const right = this.read(parent.children[k + 1]);
+        if (child.type === LEAF) {
+          child.entries = child.entries.concat(right.entries);
+          this.fm.writePage(child.pageNum, serializeLeaf(child));
+        } else {
+          child.seps = child.seps.concat(right.seps);
+          child.children = child.children.concat(right.children);
+          this.fm.writePage(child.pageNum, serializeInternal(child));
+        }
+        parent.seps.splice(k, 1);
+        parent.children.splice(k + 1, 1);
+      } else if (parent.children[k - 1]) {
+        // Merge the underflowed child into the left sibling.
+        const left = this.read(parent.children[k - 1]);
+        if (child.type === LEAF) {
+          left.entries = left.entries.concat(child.entries);
+          this.fm.writePage(left.pageNum, serializeLeaf(left));
+        } else {
+          left.seps = left.seps.concat(child.seps);
+          left.children = left.children.concat(child.children);
+          this.fm.writePage(left.pageNum, serializeInternal(left));
+        }
+        parent.seps.splice(k - 1, 1);
+        parent.children.splice(k, 1);
+      }
+      this.fm.writePage(parent.pageNum, serializeInternal(parent));
+    }
+
+    // If the root is an internal page with no separators, it becomes its single child.
+    const root = this.read(this.rootPage);
+    if (root.type === INTERNAL && root.seps.length === 0 && root.children.length > 0) {
+      this.rootPage = root.children[0];
+    }
+    return true;
+  }
+
   /** Insert or replace a (key, value). */
   insert(key, value) {
     const path = []; // [{ node, k }] for each internal level descended

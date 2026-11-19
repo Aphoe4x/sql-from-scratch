@@ -90,6 +90,42 @@ export function parse(sql) {
     return { type: 'insert', table, columns, values };
   };
 
+  // Optional `WHERE col = literal` clause (only equality supported for now).
+  const parseWhere = () => {
+    if (!isKeyword(peek(), 'WHERE')) return null;
+    expect('WHERE');
+    const col = ident();
+    expect(null, '=');
+    return { col, value: literal() };
+  };
+
+  const parseUpdate = () => {
+    expect('UPDATE');
+    const table = ident();
+    expect('SET');
+    const sets = [];
+    for (;;) {
+      const col = ident();
+      expect(null, '=');
+      sets.push({ col, value: literal() });
+      if (isPunct(peek(), ',')) {
+        next();
+        continue;
+      }
+      break;
+    }
+    const where = parseWhere();
+    return { type: 'update', table, sets, where };
+  };
+
+  const parseDelete = () => {
+    expect('DELETE');
+    expect('FROM');
+    const table = ident();
+    const where = parseWhere();
+    return { type: 'delete', table, where };
+  };
+
   const parseSelect = () => {
     expect('SELECT');
     let columns = null;
@@ -133,6 +169,8 @@ export function parse(sql) {
   const t = peek();
   if (isWord(t, 'CREATE')) return parseCreateTable();
   if (isWord(t, 'INSERT')) return parseInsert();
+  if (isWord(t, 'UPDATE')) return parseUpdate();
+  if (isWord(t, 'DELETE')) return parseDelete();
   if (isWord(t, 'SELECT')) return parseSelect();
   throw new Error(`parse: unsupported statement '${t?.value ?? 'EOF'}'`);
 }

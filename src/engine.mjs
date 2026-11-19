@@ -109,16 +109,28 @@ export class Database {
     table.committedNextId = table.nextId;
   }
 
+  /**
+   * Shared WHERE-filter builder. Returns a `scan` filter or null.
+   * Supports single equality on the key column or any data column.
+   */
+  buildFilter(table, where) {
+    if (!where) return null;
+    const keyCol = this.keyColumnOf(table);
+    return (key, value) => (where.col === keyCol.name ? key === where.value : decodeValue(table, value)[where.col] === where.value);
+  }
+
+  queryRow(table, key, value) {
+    const keyCol = this.keyColumnOf(table);
+    return { [keyCol.name]: key, ...decodeValue(table, value) };
+  }
+
   query(tableName, { where = null, orderBy = null, columns = null } = {}) {
     const table = this.tables.get(tableName);
     if (!table) throw new Error(`query: no such table '${tableName}'`);
-    const keyCol = this.keyColumnOf(table);
-    const filter = where
-      ? (key, value) => (where.col === keyCol.name ? key === where.value : decodeValue(table, value)[where.col] === where.value)
-      : null;
+    const filter = this.buildFilter(table, where);
     let rows = [];
     for (const { key, value } of table.bt.scan(filter)) {
-      rows.push({ [keyCol.name]: key, ...decodeValue(table, value) });
+      rows.push(this.queryRow(table, key, value));
     }
     if (orderBy) {
       const dir = orderBy.dir === 'DESC' ? -1 : 1;
@@ -148,6 +160,16 @@ export class Database {
       this.commit();
       return { rows: [], columns: [], key, plan: null };
     }
+    if (ast.type === 'update') {
+      const updated = this.update(ast.table, ast.sets, ast.where);
+      this.commit();
+      return { rows: [], columns: [], updated, plan: null };
+    }
+    if (ast.type === 'delete') {
+      const deleted = this.delete(ast.table, ast.where);
+      this.commit();
+      return { rows: [], columns: [], deleted, plan: null };
+    }
     if (ast.type === 'select') {
       const table = this.tables.get(ast.table);
       const rows = this.query(ast.table, { where: ast.where, orderBy: ast.orderBy, columns: ast.columns });
@@ -165,6 +187,39 @@ export class Database {
       row[col] = ast.values[i];
     });
     return row;
+  }
+
+  /**
+   * UPDATE t SET col = v [, col = v ...] [WHERE c = v]
+   * Returns the number of rows updated.
+   */
+  update(tableName, sets, where = null) {
+    const table = this.tables.get(tableName);
+    if (!table) throw new Error(`update: no such table '${tableName}'`);
+    const filter = this.buildFilter(table, where);
+    let updated = 0;
+    for (const { key, value } of table.bt.scan(filter)) {
+      const newRow = { ...this.queryRow(table, key, value), ...Object.fromEntries(sets.map((s) => [s.col, s.value])) };
+      if (!table.bt.update(key, encodeValue(table, newRow))) throw new Error(`update: key ${key} not found`);
+      updated++;
+    }
+    return updated;
+  }
+
+  /**
+   * DELETE FROM t [WHERE c = v] — collect keys first (tree mutates during delete).
+   * Returns the number of rows deleted.
+   */
+  delete(tableName, where = null) {
+    const table = this.tables.get(tableName);
+    if (!table) throw new Error(`delete: no such table '${tableName}'`);
+    const filter = this.buildFilter(table, where);
+    const keys = [...table.bt.scan(filter)].map((e) => e.key);
+    let deleted = 0;
+    for (const key of keys) {
+      if (table.bt.delete(key)) deleted++;
+    }
+    return deleted;
   }
 
   begin() {
