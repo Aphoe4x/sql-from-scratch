@@ -1,8 +1,12 @@
 // src/lexer.mjs — SQL tokenizer for the small subset supported by the engine:
 //   CREATE TABLE t (col TYPE [PRIMARY KEY], ...)
 //   INSERT INTO t [(col, ...)] VALUES (literal, ...)
-//   SELECT [cols|*] FROM t [WHERE c = literal] [ORDER BY c [ASC|DESC]]
-// Literals: 'text' (with '' escape) and numbers.
+//   SELECT [DISTINCT-less projection] FROM t [alias] [JOIN t2 ON a.x = b.y]
+//          [WHERE cond [AND cond ...]] [GROUP BY col, ...] [HAVING cond]
+//          [ORDER BY col [ASC|DESC], ...]
+//   UPDATE t SET col = literal [WHERE ...]   /   DELETE FROM t [WHERE ...]
+// Identifiers may be qualified (t.col). Literals: 'text' ('' escapes) and numbers.
+// Operators: = != <> < <= > >= BETWEEN.
 
 export function tokenize(sql) {
   const tokens = [];
@@ -36,7 +40,8 @@ export function tokenize(sql) {
       i = j;
     } else if (/[A-Za-z_]/.test(ch)) {
       let j = i;
-      while (j < sql.length && /[A-Za-z0-9_]/.test(sql[j])) j++;
+      // Identifiers may be qualified: `orders.id`, `o.id`.
+      while (j < sql.length && /[A-Za-z0-9_.]/.test(sql[j])) j++;
       tokens.push({ kind: 'word', value: sql.slice(i, j) });
       i = j;
     } else if (ch === '!') {

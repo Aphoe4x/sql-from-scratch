@@ -92,6 +92,13 @@ export function parse(sql) {
 
   // --- Conditions (WHERE / HAVING) ---
 
+  const parseOperand = () => {
+    const t = peek();
+    // A bare word on the right-hand side is a column reference, not a literal.
+    if (t && t.kind === 'word') return { valueCol: ident() };
+    return { value: literal() };
+  };
+
   const parseCondition = () => {
     const col = ident();
     const t = next();
@@ -106,7 +113,7 @@ export function parse(sql) {
       case '<':
       case '>=':
       case '<=':
-        return { col, op, value: literal() };
+        return { col, op, ...parseOperand() };
       case 'BETWEEN': {
         const v1 = literal();
         expect('AND');
@@ -164,11 +171,16 @@ export function parse(sql) {
     return null;
   };
 
-  // SELECT item: `col`, `col AS alias`, or a function call `F(*)` / `F(col)`.
+  // SELECT item: `col`, `col AS alias`, `*`, `t.*`, or a function call `F(*)` / `F(col)`.
   const parseSelectItem = () => {
     const t = next();
     if (t.kind === 'punct' && t.value === '*') return { kind: 'col', name: '*', alias: null };
     if (t.kind === 'word') {
+      // Qualified star: the lexer reads `a.*` as word 'a.' followed by '*'.
+      if (t.value.endsWith('.') && isPunct(peek(), '*')) {
+        next();
+        return { kind: 'col', name: `${t.value}*`, alias: null };
+      }
       const p2 = tokens[pos];
       if (p2 && p2.kind === 'punct' && p2.value === '(') {
         // Function call.
@@ -206,11 +218,79 @@ export function parse(sql) {
     if (!isKeyword(peek(), 'ORDER')) return null;
     expect('ORDER');
     expect('BY');
-    const col = ident();
-    let dir = 'ASC';
-    const t = peek();
-    if (t && t.kind === 'word' && (t.value === 'ASC' || t.value === 'DESC')) dir = next().value;
-    return { col, dir };
+    const keys = [];
+    for (;;) {
+      const col = ident();
+      let dir = 'ASC';
+      const t = peek();
+      if (t && t.kind === 'word' && (t.value.toUpperCase() === 'ASC' || t.value.toUpperCase() === 'DESC')) dir = next().value.toUpperCase();
+      keys.push({ col, dir });
+      if (isPunct(peek(), ',')) {
+        next();
+        continue;
+      }
+      break;
+    }
+    return keys;
+  };
+
+  // Words that terminate a table reference (so they are not eaten as an alias).
+  const NOT_AN_ALIAS = new Set(['WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'ON', 'GROUP', 'ORDER', 'HAVING', 'AS', 'LIMIT', 'UNION']);
+
+  const parseTableRef = () => {
+    const table = ident();
+    let alias = null;
+    if (isKeyword(peek(), 'AS')) {
+      expect('AS');
+      alias = ident();
+    } else {
+      const t = peek();
+      if (t && t.kind === 'word' && !NOT_AN_ALIAS.has(t.value.toUpperCase())) alias = next().value;
+    }
+    return { table, alias };
+  };
+
+  /**
+   * FROM base [, other ...] [JOIN other ON a.x = b.y ...]
+   * Comma-joins are cross joins; `INNER` is optional; `LEFT [OUTER] JOIN` keeps
+   * unmatched left rows with a null right side (resolved as undefined columns).
+   */
+  const parseFrom = () => {
+    const from = parseTableRef();
+    const joins = [];
+    for (;;) {
+      if (isPunct(peek(), ',')) {
+        next();
+        joins.push({ type: 'cross', on: null, ...parseTableRef() });
+        continue;
+      }
+      let type = null;
+      if (isKeyword(peek(), 'INNER')) {
+        expect('INNER');
+        expect('JOIN');
+        type = 'inner';
+      } else if (isKeyword(peek(), 'LEFT')) {
+        expect('LEFT');
+        if (isKeyword(peek(), 'OUTER')) expect('OUTER');
+        expect('JOIN');
+        type = 'left';
+      } else if (isKeyword(peek(), 'JOIN')) {
+        expect('JOIN');
+        type = 'inner';
+      } else {
+        break;
+      }
+      const ref = parseTableRef();
+      let on = null;
+      if (isKeyword(peek(), 'ON')) {
+        expect('ON');
+        const left = ident();
+        expect(null, '=');
+        on = { left, right: ident() };
+      }
+      joins.push({ type, on, ...ref });
+    }
+    return { from, joins };
   };
 
   const parseSelect = () => {
@@ -230,12 +310,13 @@ export function parse(sql) {
       }
     }
     expect('FROM');
-    const table = ident();
+    const { from, joins } = parseFrom();
     const where = parseWhere();
     const groupBy = parseGroupBy();
     const having = parseHaving();
-    const orderBy = parseOrderBy();
-    return { type: 'select', table, selectItems, where, groupBy, having, orderBy };
+    const orderByKeys = parseOrderBy();
+    const orderBy = orderByKeys ? orderByKeys[0] : null;
+    return { type: 'select', table: from.table, from, joins, selectItems, where, groupBy, having, orderBy, orderByKeys };
   };
 
   const t = peek();

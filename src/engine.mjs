@@ -10,32 +10,40 @@ import { parse as parseAst } from './parser.mjs';
 
 const VALUE_TYPES = { integer: 0, text: 1 };
 
-/** Evaluate one WHERE/HAVING condition against a row object. */
-function conditionMatches(cond, row) {
-  const actual = row[cond.col];
+/** `c.name` -> `name`; plain names pass through (used for output labels). */
+const bareName = (name) => {
+  const dot = name.indexOf('.');
+  return dot > 0 ? name.slice(dot + 1) : name;
+};
+
+/** Evaluate one WHERE/HAVING condition, reading values through `getVal(name)`. */
+function conditionMatches(cond, getVal) {
+  const actual = getVal(cond.col);
+  const other = cond.valueCol !== undefined ? getVal(cond.valueCol) : cond.value;
+  const between = (v) => v >= cond.values[0] && v <= cond.values[1];
   switch (cond.op) {
     case '=':
-      return actual === cond.value;
+      return actual === other;
     case '!=':
     case '<>':
-      return actual !== cond.value;
+      return actual !== other;
     case '>':
-      return actual > cond.value;
+      return actual > other;
     case '<':
-      return actual < cond.value;
+      return actual < other;
     case '>=':
-      return actual >= cond.value;
+      return actual >= other;
     case '<=':
-      return actual <= cond.value;
+      return actual <= other;
     case 'between':
-      return actual >= cond.values[0] && actual <= cond.values[1];
+      return between(actual);
     default:
       throw new Error(`engine: unsupported condition op '${cond.op}'`);
   }
 }
 
-function matchesWhere(where, row) {
-  return where.conditions.every((c) => conditionMatches(c, row));
+function matchesWhere(where, getVal) {
+  return where.conditions.every((c) => conditionMatches(c, getVal));
 }
 
 function encodeValue(table, row) {
@@ -143,7 +151,10 @@ export class Database {
    */
   buildFilter(table, where) {
     if (!where) return null;
-    return (key, value) => matchesWhere(where, this.queryRow(table, key, value));
+    return (key, value) => {
+      const row = this.queryRow(table, key, value);
+      return matchesWhere(where, (name) => row[name]);
+    };
   }
 
   queryRow(table, key, value) {
@@ -152,15 +163,33 @@ export class Database {
   }
 
   /**
+   * Resolve `col` or `alias.col` against a joined row object ({ alias: row }).
+   * An unqualified name searches every source; if several tables expose it,
+   * the first one in FROM order wins (documented limitation — qualify to be safe).
+   */
+  resolveCol(joined, name) {
+    const dot = name.indexOf('.');
+    if (dot > 0) {
+      const src = joined[name.slice(0, dot)];
+      return src ? src[name.slice(dot + 1)] : undefined;
+    }
+    for (const row of Object.values(joined)) {
+      if (row && Object.prototype.hasOwnProperty.call(row, name)) return row[name];
+    }
+    return undefined;
+  }
+
+  /**
    * Aggregate value for one SELECT item over the rows of a group:
    * count(*) = row count, count(col) = non-null values, sum/avg/min/max.
+   * `get(row, col)` resolves column names for joined rows.
    */
-  aggregate(item, rows, table) {
+  aggregate(item, rows, get) {
     if (item.fn === 'count') {
       if (item.col == null) return rows.length;
-      return rows.filter((r) => r[item.col] !== undefined).length;
+      return rows.filter((r) => get(r, item.col) !== undefined).length;
     }
-    const vals = item.col == null ? [] : rows.map((r) => r[item.col]).filter((v) => v !== undefined);
+    const vals = item.col == null ? [] : rows.map((r) => get(r, item.col)).filter((v) => v !== undefined);
     switch (item.fn) {
       case 'sum':
         return vals.reduce((a, b) => a + b, 0);
@@ -176,14 +205,63 @@ export class Database {
   }
 
   /**
-   * SELECT execution with grouping and aggregates.
-   * AST shape: { table, selectItems, where, groupBy, having, orderBy }.
+   * SELECT execution: nested-loop joins (INNER / LEFT / comma-cross), grouping,
+   * aggregates, HAVING and ORDER BY.
+   * AST shape: { table, from, joins, selectItems, where, groupBy, having, orderBy }.
    */
   execSelect(ast) {
-    const table = this.tables.get(ast.table);
-    if (!table) throw new Error(`select: no such table '${ast.table}'`);
-    const filter = this.buildFilter(table, ast.where);
-    const rows = [...table.bt.scan(filter)].map((e) => this.queryRow(table, e.key, e.value));
+    const from = ast.from ?? { table: ast.table, alias: null };
+    const base = this.tables.get(from.table);
+    if (!base) throw new Error(`select: no such table '${from.table}'`);
+
+    const sources = [{ alias: from.alias ?? from.table, table: base, join: null }];
+    for (const j of ast.joins ?? []) {
+      const t = this.tables.get(j.table);
+      if (!t) throw new Error(`select: no such table '${j.table}'`);
+      sources.push({ alias: j.alias ?? j.table, table: t, join: j });
+    }
+
+    const rowsOf = (t) => [...t.bt.scan(null)].map((e) => this.queryRow(t, e.key, e.value));
+
+    // Nested-loop join: start with the base rows, then multiply by each join source.
+    let joined = rowsOf(base).map((r) => ({ [sources[0].alias]: r }));
+    for (let si = 1; si < sources.length; si++) {
+      const src = sources[si];
+      const other = rowsOf(src.table);
+      const next = [];
+      for (const left of joined) {
+        let matched = false;
+        for (const right of other) {
+          const cand = { ...left, [src.alias]: right };
+          if (src.join.on) {
+            const lv = this.resolveCol(cand, src.join.on.left);
+            const rv = this.resolveCol(cand, src.join.on.right);
+            if (lv !== rv) continue;
+          }
+          next.push(cand);
+          matched = true;
+        }
+        if (!matched && src.join.type === 'left') next.push({ ...left, [src.alias]: null });
+      }
+      joined = next;
+    }
+
+    const get = (row, name) => this.resolveCol(row, name);
+
+    const rows = ast.where
+      ? joined.filter((row) => matchesWhere(ast.where, (name) => get(row, name)))
+      : joined;
+
+    // Columns exposed by more than one source get an `alias.col` key in `SELECT *`.
+    const dupNames = new Set();
+    const seen = new Set();
+    for (const s of sources) {
+      for (const c of s.table.columns) {
+        if (seen.has(c.name)) dupNames.add(c.name);
+        seen.add(c.name);
+      }
+    }
+    const starKey = (src, colName) => (dupNames.has(colName) ? `${src.alias}.${colName}` : colName);
 
     // Grouping semantics:
     //  - GROUP BY present            -> one group per distinct groupBy value
@@ -194,7 +272,7 @@ export class Database {
     let gid = 0;
     for (const row of rows) {
       const gkey = ast.groupBy
-        ? ast.groupBy.map((c) => JSON.stringify(row[c.name])).join('|')
+        ? ast.groupBy.map((c) => JSON.stringify(get(row, c.name))).join('|')
         : hasAgg
           ? '__all__'
           : `__row_${gid++}`;
@@ -206,42 +284,63 @@ export class Database {
       g.rows.push(row);
     }
 
-    const outputs = [];
+    const entries = [];
     for (const g of groups.values()) {
       const out = {};
-      if (ast.groupBy) for (const c of ast.groupBy) out[c.name] = g.row[c.name];
+      if (ast.groupBy) for (const c of ast.groupBy) out[c.name] = get(g.row, c.name);
       for (const item of ast.selectItems) {
         if (item.kind === 'col') {
-          if (item.name === '*') {
-            for (const c of table.columns) out[c.name] = g.row[c.name];
+          const isStar = item.name === '*' || item.name.endsWith('.*');
+          if (isStar) {
+            const only = item.name === '*' ? null : item.name.slice(0, -2);
+            for (const src of sources) {
+              if (only && src.alias !== only) continue;
+              const r = g.row[src.alias];
+              for (const col of src.table.columns) {
+                out[starKey(src, col.name)] = r ? r[col.name] : undefined;
+              }
+            }
           } else {
-            out[item.alias ?? item.name] = g.row[item.name];
+            out[item.alias ?? bareName(item.name)] = get(g.row, item.name);
           }
         } else {
           const aggKey = item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`;
-          out[aggKey] = this.aggregate(item, g.rows, table);
+          out[aggKey] = this.aggregate(item, g.rows, get);
         }
       }
-      if (ast.having && !conditionMatches(ast.having, out)) continue;
-      outputs.push(out);
+      if (ast.having && !conditionMatches(ast.having, (name) => out[name])) continue;
+      entries.push({ out, srcRow: g.row });
     }
 
-    if (ast.orderBy) {
-      const dir = ast.orderBy.dir === 'DESC' ? -1 : 1;
-      outputs.sort((a, b) => {
-        const av = a[ast.orderBy.col];
-        const bv = b[ast.orderBy.col];
-        if (av === bv) return 0;
-        return (av < bv ? -1 : 1) * dir;
+    const sortKeys = ast.orderByKeys ?? (ast.orderBy ? [ast.orderBy] : null);
+    if (sortKeys) {
+      const val = (e, col) => {
+        const v = e.out[col];
+        return v !== undefined ? v : get(e.srcRow, col);
+      };
+      entries.sort((a, b) => {
+        for (const k of sortKeys) {
+          const av = val(a, k.col);
+          const bv = val(b, k.col);
+          if (av === bv) continue;
+          return (av < bv ? -1 : 1) * (k.dir === 'DESC' ? -1 : 1);
+        }
+        return 0;
       });
     }
 
     const columns = ast.selectItems.flatMap((item) => {
-      if (item.kind === 'col' && item.name === '*') return table.columns.map((c) => c.name);
-      if (item.kind === 'col') return [item.alias ?? item.name];
+      const isStar = item.kind === 'col' && (item.name === '*' || item.name.endsWith('.*'));
+      if (isStar) {
+        const only = item.name === '*' ? null : item.name.slice(0, -2);
+        return sources
+          .filter((s) => !only || s.alias === only)
+          .flatMap((s) => s.table.columns.map((c) => starKey(s, c.name)));
+      }
+      if (item.kind === 'col') return [item.alias ?? bareName(item.name)];
       return [item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`];
     });
-    return { rows: outputs, columns };
+    return { rows: entries.map((e) => e.out), columns };
   }
 
   query(tableName, { where = null, orderBy = null, columns = null } = {}) {
@@ -262,8 +361,18 @@ export class Database {
 
   plan(ast) {
     if (ast.type !== 'select') return null;
-    const table = this.tables.get(ast.table);
+    const from = ast.from ?? { table: ast.table };
+    const table = this.tables.get(from.table);
     const stats = table.bt.stats();
+    const joins = ast.joins ?? [];
+    if (joins.length) {
+      const jstats = joins.map((j) => this.tables.get(j.table).bt.stats());
+      return {
+        strategy: 'nested-loop-join',
+        pages: stats.pageCount + jstats.reduce((a, s) => a + s.pageCount, 0),
+        rowsEstimate: jstats.reduce((a, s) => a * s.entryCount, stats.entryCount),
+      };
+    }
     if (ast.where) return { strategy: 'index-seek', pages: stats.depth + 1, rowsEstimate: 1 };
     return { strategy: 'full-scan', pages: stats.pageCount, rowsEstimate: stats.entryCount };
   }
