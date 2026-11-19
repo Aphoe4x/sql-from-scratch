@@ -39,6 +39,29 @@ export function tokenize(sql) {
       while (j < sql.length && /[A-Za-z0-9_]/.test(sql[j])) j++;
       tokens.push({ kind: 'word', value: sql.slice(i, j) });
       i = j;
+    } else if (ch === '!') {
+      if (sql[i + 1] !== '=') throw new Error(`lexer: unexpected '!' at offset ${i}`);
+      tokens.push({ kind: 'punct', value: '!=' });
+      i += 2;
+    } else if (ch === '<') {
+      if (sql[i + 1] === '>') {
+        tokens.push({ kind: 'punct', value: '<>' });
+        i += 2;
+      } else if (sql[i + 1] === '=') {
+        tokens.push({ kind: 'punct', value: '<=' });
+        i += 2;
+      } else {
+        tokens.push({ kind: 'punct', value: '<' });
+        i += 1;
+      }
+    } else if (ch === '>') {
+      if (sql[i + 1] === '=') {
+        tokens.push({ kind: 'punct', value: '>=' });
+        i += 2;
+      } else {
+        tokens.push({ kind: 'punct', value: '>' });
+        i += 1;
+      }
     } else if ('(),=;*'.includes(ch)) {
       tokens.push({ kind: 'punct', value: ch });
       i++;

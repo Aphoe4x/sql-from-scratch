@@ -10,6 +10,34 @@ import { parse as parseAst } from './parser.mjs';
 
 const VALUE_TYPES = { integer: 0, text: 1 };
 
+/** Evaluate one WHERE/HAVING condition against a row object. */
+function conditionMatches(cond, row) {
+  const actual = row[cond.col];
+  switch (cond.op) {
+    case '=':
+      return actual === cond.value;
+    case '!=':
+    case '<>':
+      return actual !== cond.value;
+    case '>':
+      return actual > cond.value;
+    case '<':
+      return actual < cond.value;
+    case '>=':
+      return actual >= cond.value;
+    case '<=':
+      return actual <= cond.value;
+    case 'between':
+      return actual >= cond.values[0] && actual <= cond.values[1];
+    default:
+      throw new Error(`engine: unsupported condition op '${cond.op}'`);
+  }
+}
+
+function matchesWhere(where, row) {
+  return where.conditions.every((c) => conditionMatches(c, row));
+}
+
 function encodeValue(table, row) {
   const parts = [];
   for (const col of table.columns) {
@@ -111,17 +139,109 @@ export class Database {
 
   /**
    * Shared WHERE-filter builder. Returns a `scan` filter or null.
-   * Supports single equality on the key column or any data column.
+   * Supports =, !=, <>, >, <, >=, <=, BETWEEN and AND-chains on the key or data columns.
    */
   buildFilter(table, where) {
     if (!where) return null;
-    const keyCol = this.keyColumnOf(table);
-    return (key, value) => (where.col === keyCol.name ? key === where.value : decodeValue(table, value)[where.col] === where.value);
+    return (key, value) => matchesWhere(where, this.queryRow(table, key, value));
   }
 
   queryRow(table, key, value) {
     const keyCol = this.keyColumnOf(table);
     return { [keyCol.name]: key, ...decodeValue(table, value) };
+  }
+
+  /**
+   * Aggregate value for one SELECT item over the rows of a group:
+   * count(*) = row count, count(col) = non-null values, sum/avg/min/max.
+   */
+  aggregate(item, rows, table) {
+    if (item.fn === 'count') {
+      if (item.col == null) return rows.length;
+      return rows.filter((r) => r[item.col] !== undefined).length;
+    }
+    const vals = item.col == null ? [] : rows.map((r) => r[item.col]).filter((v) => v !== undefined);
+    switch (item.fn) {
+      case 'sum':
+        return vals.reduce((a, b) => a + b, 0);
+      case 'avg':
+        return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+      case 'min':
+        return vals.length ? Math.min(...vals) : null;
+      case 'max':
+        return vals.length ? Math.max(...vals) : null;
+      default:
+        throw new Error(`aggregate: unsupported function '${item.fn}'`);
+    }
+  }
+
+  /**
+   * SELECT execution with grouping and aggregates.
+   * AST shape: { table, selectItems, where, groupBy, having, orderBy }.
+   */
+  execSelect(ast) {
+    const table = this.tables.get(ast.table);
+    if (!table) throw new Error(`select: no such table '${ast.table}'`);
+    const filter = this.buildFilter(table, ast.where);
+    const rows = [...table.bt.scan(filter)].map((e) => this.queryRow(table, e.key, e.value));
+
+    // Grouping semantics:
+    //  - GROUP BY present            -> one group per distinct groupBy value
+    //  - aggregates, no GROUP BY     -> a single group of all rows
+    //  - otherwise                   -> one singleton group per row
+    const hasAgg = ast.selectItems.some((i) => i.kind === 'agg');
+    const groups = new Map();
+    let gid = 0;
+    for (const row of rows) {
+      const gkey = ast.groupBy
+        ? ast.groupBy.map((c) => JSON.stringify(row[c.name])).join('|')
+        : hasAgg
+          ? '__all__'
+          : `__row_${gid++}`;
+      let g = groups.get(gkey);
+      if (!g) {
+        g = { row, rows: [] };
+        groups.set(gkey, g);
+      }
+      g.rows.push(row);
+    }
+
+    const outputs = [];
+    for (const g of groups.values()) {
+      const out = {};
+      if (ast.groupBy) for (const c of ast.groupBy) out[c.name] = g.row[c.name];
+      for (const item of ast.selectItems) {
+        if (item.kind === 'col') {
+          if (item.name === '*') {
+            for (const c of table.columns) out[c.name] = g.row[c.name];
+          } else {
+            out[item.alias ?? item.name] = g.row[item.name];
+          }
+        } else {
+          const aggKey = item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`;
+          out[aggKey] = this.aggregate(item, g.rows, table);
+        }
+      }
+      if (ast.having && !conditionMatches(ast.having, out)) continue;
+      outputs.push(out);
+    }
+
+    if (ast.orderBy) {
+      const dir = ast.orderBy.dir === 'DESC' ? -1 : 1;
+      outputs.sort((a, b) => {
+        const av = a[ast.orderBy.col];
+        const bv = b[ast.orderBy.col];
+        if (av === bv) return 0;
+        return (av < bv ? -1 : 1) * dir;
+      });
+    }
+
+    const columns = ast.selectItems.flatMap((item) => {
+      if (item.kind === 'col' && item.name === '*') return table.columns.map((c) => c.name);
+      if (item.kind === 'col') return [item.alias ?? item.name];
+      return [item.alias ?? `${item.fn}${item.col ? `(${item.col})` : '(*)'}`];
+    });
+    return { rows: outputs, columns };
   }
 
   query(tableName, { where = null, orderBy = null, columns = null } = {}) {
@@ -171,9 +291,7 @@ export class Database {
       return { rows: [], columns: [], deleted, plan: null };
     }
     if (ast.type === 'select') {
-      const table = this.tables.get(ast.table);
-      const rows = this.query(ast.table, { where: ast.where, orderBy: ast.orderBy, columns: ast.columns });
-      return { rows, columns: ast.columns ?? table.columns.map((c) => c.name), plan: this.plan(ast) };
+      return { ...this.execSelect(ast), plan: this.plan(ast) };
     }
     throw new Error(`unsupported statement type: ${ast.type}`);
   }

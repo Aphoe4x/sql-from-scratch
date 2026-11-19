@@ -90,13 +90,43 @@ export function parse(sql) {
     return { type: 'insert', table, columns, values };
   };
 
-  // Optional `WHERE col = literal` clause (only equality supported for now).
+  // --- Conditions (WHERE / HAVING) ---
+
+  const parseCondition = () => {
+    const col = ident();
+    const t = next();
+    // Operators are punct tokens, except BETWEEN which is a word.
+    const op = t.kind === 'punct' ? t.value : t.kind === 'word' && t.value.toUpperCase() === 'BETWEEN' ? 'BETWEEN' : undefined;
+    if (op == null) throw new Error(`parse: expected operator, got '${t?.value ?? 'EOF'}'`);
+    switch (op) {
+      case '=':
+      case '!=':
+      case '<>':
+      case '>':
+      case '<':
+      case '>=':
+      case '<=':
+        return { col, op, value: literal() };
+      case 'BETWEEN': {
+        const v1 = literal();
+        expect('AND');
+        return { col, op: 'between', values: [v1, literal()] };
+      }
+      default:
+        throw new Error(`parse: unsupported operator '${op}'`);
+    }
+  };
+
+  // Optional `WHERE c1 [AND c2 ...]` clause.
   const parseWhere = () => {
     if (!isKeyword(peek(), 'WHERE')) return null;
     expect('WHERE');
-    const col = ident();
-    expect(null, '=');
-    return { col, value: literal() };
+    const conditions = [parseCondition()];
+    while (isKeyword(peek(), 'AND')) {
+      expect('AND');
+      conditions.push(parseCondition());
+    }
+    return { conditions };
   };
 
   const parseUpdate = () => {
@@ -126,15 +156,72 @@ export function parse(sql) {
     return { type: 'delete', table, where };
   };
 
+  const parseAlias = () => {
+    if (isKeyword(peek(), 'AS')) {
+      expect('AS');
+      return ident();
+    }
+    return null;
+  };
+
+  // SELECT item: `col`, `col AS alias`, or a function call `F(*)` / `F(col)`.
+  const parseSelectItem = () => {
+    const t = next();
+    if (t.kind === 'punct' && t.value === '*') return { kind: 'col', name: '*', alias: null };
+    if (t.kind === 'word') {
+      const p2 = tokens[pos];
+      if (p2 && p2.kind === 'punct' && p2.value === '(') {
+        // Function call.
+        expect(null, '(');
+        let col = null;
+        if (isPunct(peek(), '*')) expect(null, '*');
+        else col = ident();
+        expect(null, ')');
+        return { kind: 'agg', fn: t.value.toLowerCase(), col, alias: parseAlias() };
+      }
+      return { kind: 'col', name: t.value, alias: parseAlias() };
+    }
+    throw new Error(`parse: expected column or function, got '${t?.value ?? 'EOF'}'`);
+  };
+
+  const parseGroupBy = () => {
+    if (!isKeyword(peek(), 'GROUP')) return null;
+    expect('GROUP');
+    expect('BY');
+    const groupBy = [{ name: ident() }];
+    while (isPunct(peek(), ',')) {
+      next();
+      groupBy.push({ name: ident() });
+    }
+    return groupBy;
+  };
+
+  const parseHaving = () => {
+    if (!isKeyword(peek(), 'HAVING')) return null;
+    expect('HAVING');
+    return parseCondition();
+  };
+
+  const parseOrderBy = () => {
+    if (!isKeyword(peek(), 'ORDER')) return null;
+    expect('ORDER');
+    expect('BY');
+    const col = ident();
+    let dir = 'ASC';
+    const t = peek();
+    if (t && t.kind === 'word' && (t.value === 'ASC' || t.value === 'DESC')) dir = next().value;
+    return { col, dir };
+  };
+
   const parseSelect = () => {
     expect('SELECT');
-    let columns = null;
+    const selectItems = [];
     if (isPunct(peek(), '*')) {
       expect(null, '*');
+      selectItems.push({ kind: 'col', name: '*', alias: null });
     } else {
-      columns = [];
       for (;;) {
-        columns.push(ident());
+        selectItems.push(parseSelectItem());
         if (isPunct(peek(), ',')) {
           next();
           continue;
@@ -144,26 +231,11 @@ export function parse(sql) {
     }
     expect('FROM');
     const table = ident();
-    let where = null;
-    if (isKeyword(peek(), 'WHERE')) {
-      expect('WHERE');
-      const col = ident();
-      expect(null, '=');
-      where = { col, value: literal() };
-    }
-    let orderBy = null;
-    if (isKeyword(peek(), 'ORDER')) {
-      expect('ORDER');
-      expect('BY');
-      const col = ident();
-      let dir = 'ASC';
-      const t = peek();
-      if (t && t.kind === 'word' && (t.value === 'ASC' || t.value === 'DESC')) {
-        dir = next().value;
-      }
-      orderBy = { col, dir };
-    }
-    return { type: 'select', table, columns, where, orderBy };
+    const where = parseWhere();
+    const groupBy = parseGroupBy();
+    const having = parseHaving();
+    const orderBy = parseOrderBy();
+    return { type: 'select', table, selectItems, where, groupBy, having, orderBy };
   };
 
   const t = peek();
