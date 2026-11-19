@@ -6,7 +6,7 @@
   "scripts": {
     "demo": "node src/main.mjs",
     "crashtest": "node src/crashtest.mjs",
-    "test": "node src/smoke_fs.mjs && node src/smoke_btree.mjs && node src/smoke_engine.mjs"
+    "test": "node src/smoke_fs.mjs && node src/smoke_btree.mjs && node src/smoke_engine.mjs && node src/smoke_dml.mjs"
   },
   "engines": { "node": ">=18" }
 }

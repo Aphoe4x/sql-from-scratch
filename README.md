@@ -9,6 +9,7 @@ npm run test              # smoke tests (file manager, B-tree, SQL engine)
 node src/smoke_fs.mjs     # FileManager unit smoke
 node src/smoke_btree.mjs  # B-tree unit smoke (7000 entries)
 node src/smoke_engine.mjs # SQL engine end-to-end (create/insert/query/reopen)
+node src/smoke_dml.mjs    # UPDATE + DELETE smoke (merge-based rebalance, delete stress)
 ```
 
 ## What it is
@@ -20,6 +21,7 @@ node src/smoke_engine.mjs # SQL engine end-to-end (create/insert/query/reopen)
 | `src/engine.mjs` | **SQL facade**: `Database.create/open/execSql/query/insert/commit/rollback`. |
 | `src/lexer.mjs` / `src/parser.mjs` | SQL lexer + parser for the subset below. |
 | `src/planner.mjs` | Static planner with real cost estimates (pages touched). |
+| DML | `UPDATE t SET col = v [WHERE c = v]` · `DELETE FROM t [WHERE c = v]` |
 | `src/main.mjs` | Demo: seed + selects. |
 | `src/crashtest.mjs` + `src/crashtest_child.mjs` | Crash-recovery test (see below). |
 
@@ -32,6 +34,12 @@ SELECT * FROM users
 SELECT id, name FROM users WHERE id = 55
 SELECT name FROM users WHERE name = 'user-55'
 SELECT * FROM users ORDER BY id DESC
+
+-- DML:
+UPDATE users SET name = 'renamed-5' WHERE id = 5
+UPDATE users SET name = 'all-same'            -- no WHERE = every row
+DELETE FROM users WHERE id = 7
+DELETE FROM users                             -- truncate the table
 ```
 
 Rows are stored in the B-tree leaves; the key column (PRIMARY KEY) is the tree key, other columns are typed-encoded values (int = 8-byte double, text = len + bytes).
