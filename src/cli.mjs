@@ -42,10 +42,28 @@ function run(sql) {
     if (res.plan && showPlan) {
       const est = res.plan.pages ?? res.plan.estimatedPages;
       const rowsEst = res.plan.rowsEstimate ?? res.plan.estimatedRows;
-      console.log(`[plan] ${res.plan.strategy} — est. ${est} page(s), ${rowsEst} row(s)`);
+      const cmp = res.plan.comparisons != null ? `, ~${res.plan.comparisons} comparison(s)` : '';
+      console.log(`[plan] ${res.plan.strategy} — est. ${est} page(s), ${rowsEst} row(s)${cmp}`);
     }
     if (res.columns?.length) {
       console.log(formatTable(res.columns, res.rows));
+    } else if (res.inserted !== undefined && res.inserted !== 1) {
+      console.log(`${res.inserted} row(s) inserted`);
+    } else if (res.column !== undefined) {
+      console.log(`added column ${res.column} (${res.rows} row(s) rewritten)`);
+    } else if (res.droppedColumn !== undefined) {
+      const also = res.indexesDropped?.length ? `, dropped index ${res.indexesDropped.join(', ')}` : '';
+      console.log(`dropped column ${res.droppedColumn} (${res.rows} row(s) rewritten${also})`);
+    } else if (res.truncated !== undefined) {
+      console.log(`truncated ${res.table} (${res.truncated} row(s) removed, ${res.pages} page(s) freed)`);
+    } else if (res.renamed !== undefined && res.to !== undefined) {
+      console.log(res.renamed ? `renamed column ${res.from} to ${res.to} on ${res.table}` : `column ${res.to} already named that`);
+    } else if (res.renamed !== undefined) {
+      console.log(res.renamed ? `renamed table ${res.from} to ${res.table}` : `table already named ${res.table}`);
+    } else if (res.created === false) {
+      console.log('OK (already exists)');
+    } else if (res.dropped === null || res.index === null) {
+      console.log('OK (nothing to drop)');
     } else if (res.key !== undefined) {
       console.log(`inserted key ${res.key}`);
     } else if (res.updated !== undefined) {
@@ -62,10 +80,19 @@ function run(sql) {
 
 function printSchema() {
   if (db.tables.size === 0) return console.log('(no tables)');
+  const lit = (v) => (typeof v === 'number' ? String(v) : `'${String(v).replaceAll("'", "''")}'`);
   for (const t of db.tables.values()) {
-    const cols = t.columns.map((c) => `${c.name} ${c.type.toUpperCase()}${c.isKey ? ' PRIMARY KEY' : ''}`).join(', ');
+    const cols = t.columns
+      .map((c) => {
+        let s = `${c.name} ${c.type.toUpperCase()}`;
+        if (c.isKey) s += ' PRIMARY KEY';
+        if (c.notNull) s += ' NOT NULL';
+        if (c.defaultValue !== undefined) s += ` DEFAULT ${lit(c.defaultValue)}`;
+        return s;
+      })
+      .join(', ');
     console.log(`CREATE TABLE ${t.name} (${cols});  -- ${t.bt.stats().entryCount} rows`);
-    for (const ix of t.indexes) console.log(`CREATE INDEX ${ix.name} ON ${t.name} (${ix.column});`);
+    for (const ix of t.indexes) console.log(`CREATE ${ix.unique ? 'UNIQUE ' : ''}INDEX ${ix.name} ON ${t.name} (${ix.column});`);
   }
 }
 

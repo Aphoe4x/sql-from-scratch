@@ -2,11 +2,16 @@
 //   CREATE TABLE t (col TYPE [PRIMARY KEY], ...)
 //   INSERT INTO t [(col, ...)] VALUES (literal, ...)
 //   SELECT [DISTINCT-less projection] FROM t [alias] [JOIN t2 ON a.x = b.y]
+// SELECT item arithmetic: `col + 1`, `100 - price`, `a * b`, `a / b`,
+// `text || text` (concatenation). Operands are columns or literals (no
+// nested parentheses); `+ - * /` coerce to numbers (non-numeric -> null),
+// `||` concatenates, and division by zero yields null.
 //          [WHERE cond [AND cond ...]] [GROUP BY col, ...] [HAVING cond]
 //          [ORDER BY col [ASC|DESC], ...]
 //   UPDATE t SET col = literal [WHERE ...]   /   DELETE FROM t [WHERE ...]
+//   SELECT ... UNION [ALL] SELECT ... [ORDER BY ...] [LIMIT ...]
 // Identifiers may be qualified (t.col). Literals: 'text' ('' escapes) and numbers.
-// Operators: = != <> < <= > >= BETWEEN.
+// Operators: = != <> < <= > >= BETWEEN IN NOT IN (list or SELECT) LIKE NOT LIKE.
 
 export function tokenize(sql) {
   const tokens = [];
@@ -67,7 +72,11 @@ export function tokenize(sql) {
         tokens.push({ kind: 'punct', value: '>' });
         i += 1;
       }
-    } else if ('(),=;*'.includes(ch)) {
+    } else if (ch === '|') {
+      if (sql[i + 1] !== '|') throw new Error(`lexer: unexpected '|' at offset ${i}`);
+      tokens.push({ kind: 'punct', value: '||' });
+      i += 2;
+    } else if ('(),=;*-+/'.includes(ch)) {
       tokens.push({ kind: 'punct', value: ch });
       i++;
     } else {

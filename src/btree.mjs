@@ -208,6 +208,17 @@ export class BTree {
     }
   }
 
+  /** All page numbers owned by this tree (internal + leaves). */
+  *pages() {
+    const stack = [this.rootPage];
+    while (stack.length) {
+      const pageNum = stack.pop();
+      yield pageNum;
+      const node = this.read(pageNum);
+      if (node.type === INTERNAL) for (const c of node.children) stack.push(c);
+    }
+  }
+
   stats() {
     let pageCount = 0,
       entryCount = 0,

@@ -17,8 +17,11 @@ console.log('users stats:', db.tables.get('users').bt.stats());
 const show = (sql) => {
   const res = db.execSql(sql);
   const plan = res.plan ?? planQuery(db, sql);
+  const pages = plan.pages ?? plan.estimatedPages;
+  const rows = plan.rowsEstimate ?? plan.estimatedRows;
+  const cmp = plan.comparisons != null ? `, ~${plan.comparisons} comparison(s)` : '';
   console.log(`\nSQL: ${sql}`);
-  console.log(`  plan: ${plan.strategy} — est. ${plan.pages} page(s), est. ${plan.rowsEstimate} row(s)`);
+  console.log(`  plan: ${plan.strategy} — est. ${pages} page(s), est. ${rows} row(s)${cmp}`);
   console.log(`  result: ${res.rows.length} row(s), first: ${JSON.stringify(res.rows[0] ?? null)}`);
 };
 

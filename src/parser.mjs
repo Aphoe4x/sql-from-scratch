@@ -31,32 +31,77 @@ export function parse(sql) {
     return t.value;
   };
 
+  // Column definition shared by CREATE TABLE and ALTER TABLE ADD COLUMN.
+  const parseColumnDef = () => {
+    const name = ident();
+    const type = ident();
+    let isKey = false;
+    let notNull = false;
+    let defaultValue;
+    // Column constraints, in any order.
+    for (;;) {
+      if (isKeyword(peek(), 'PRIMARY')) {
+        expect('PRIMARY');
+        expect('KEY');
+        isKey = true;
+      } else if (isKeyword(peek(), 'NOT')) {
+        expect('NOT');
+        expect('NULL');
+        notNull = true;
+      } else if (isKeyword(peek(), 'DEFAULT')) {
+        expect('DEFAULT');
+        defaultValue = literal();
+      } else {
+        break;
+      }
+    }
+    return { name, type: type.toUpperCase(), isKey, notNull, defaultValue };
+  };
+
   const parseCreate = () => {
     expect('CREATE');
+    let unique = false;
+    if (isKeyword(peek(), 'UNIQUE')) {
+      expect('UNIQUE');
+      unique = true;
+    }
     if (isKeyword(peek(), 'INDEX')) {
       expect('INDEX');
+      let ifNotExists = false;
+      if (isKeyword(peek(), 'IF')) {
+        expect('IF');
+        expect('NOT');
+        expect('EXISTS');
+        ifNotExists = true;
+      }
       const name = ident();
       expect('ON');
       const table = ident();
       expect(null, '(');
       const column = ident();
       expect(null, ')');
-      return { type: 'createIndex', name, table, column };
+      return { type: 'createIndex', name, table, column, unique, ifNotExists };
     }
+    if (unique) throw new Error('parse: UNIQUE is only supported for CREATE UNIQUE INDEX');
     expect('TABLE');
+    let ifNotExists = false;
+    if (isKeyword(peek(), 'IF')) {
+      expect('IF');
+      expect('NOT');
+      expect('EXISTS');
+      ifNotExists = true;
+    }
     const name = ident();
+    // CREATE TABLE name AS SELECT ...
+    if (isKeyword(peek(), 'AS')) {
+      expect('AS');
+      const select = parseQuery();
+      return { type: 'createTableAs', name, select, ifNotExists };
+    }
     expect(null, '(');
     const columns = [];
     for (;;) {
-      const cname = ident();
-      const ctype = ident();
-      let isKey = false;
-      if (isKeyword(peek(), 'PRIMARY')) {
-        expect('PRIMARY');
-        expect('KEY');
-        isKey = true;
-      }
-      columns.push({ name: cname, type: ctype.toUpperCase(), isKey });
+      columns.push(parseColumnDef());
       if (isPunct(peek(), ',')) {
         next();
         continue;
@@ -64,7 +109,7 @@ export function parse(sql) {
       break;
     }
     expect(null, ')');
-    return { type: 'createTable', name, columns };
+    return { type: 'createTable', name, columns, ifNotExists };
   };
 
   const parseInsert = () => {
@@ -85,19 +130,33 @@ export function parse(sql) {
       }
       expect(null, ')');
     }
+    if (isKeyword(peek(), 'SELECT')) {
+      return { type: 'insertSelect', table, columns, select: parseQuery() };
+    }
+    if (!isKeyword(peek(), 'VALUES')) throw new Error(`parse: expected VALUES or SELECT after INSERT INTO ${table}`);
     expect('VALUES');
-    expect(null, '(');
-    const values = [];
+    // One or more tuples: VALUES (...), (...), ...
+    const rows = [];
     for (;;) {
-      values.push(literal());
-      if (isPunct(peek(), ',')) {
+      expect(null, '(');
+      const values = [];
+      for (;;) {
+        values.push(literal());
+        if (isPunct(peek(), ',')) {
+          next();
+          continue;
+        }
+        break;
+      }
+      expect(null, ')');
+      rows.push(values);
+      if (isPunct(peek(), ',') && isPunct(tokens[pos + 1], '(')) {
         next();
         continue;
       }
       break;
     }
-    expect(null, ')');
-    return { type: 'insert', table, columns, values };
+    return { type: 'insert', table, columns, rows };
   };
 
   // --- Conditions (WHERE / HAVING) ---
@@ -109,8 +168,45 @@ export function parse(sql) {
     return { value: literal() };
   };
 
-  const parseCondition = () => {
+  // `(literal, ...)` or `(SELECT ...)` for IN / NOT IN.
+  const parseInList = () => {
+    expect(null, '(');
+    if (isKeyword(peek(), 'SELECT')) {
+      const select = parseQuery();
+      expect(null, ')');
+      return { select };
+    }
+    const values = [literal()];
+    while (isPunct(peek(), ',')) {
+      next();
+      values.push(literal());
+    }
+    expect(null, ')');
+    return { values };
+  };
+
+  const parseComparison = () => {
     const col = ident();
+    if (isKeyword(peek(), 'IN')) {
+      expect('IN');
+      return { col, op: 'in', ...parseInList() };
+    }
+    if (isKeyword(peek(), 'NOT')) {
+      expect('NOT');
+      if (isKeyword(peek(), 'IN')) {
+        expect('IN');
+        return { col, op: 'not-in', ...parseInList() };
+      }
+      if (isKeyword(peek(), 'LIKE')) {
+        expect('LIKE');
+        return { col, op: 'not-like', value: literal() };
+      }
+      throw new Error('parse: expected IN or LIKE after NOT');
+    }
+    if (isKeyword(peek(), 'LIKE')) {
+      expect('LIKE');
+      return { col, op: 'like', value: literal() };
+    }
     const t = next();
     // Operators are punct tokens, except BETWEEN which is a word.
     const op = t.kind === 'punct' ? t.value : t.kind === 'word' && t.value.toUpperCase() === 'BETWEEN' ? 'BETWEEN' : undefined;
@@ -134,16 +230,42 @@ export function parse(sql) {
     }
   };
 
-  // Optional `WHERE c1 [AND c2 ...]` clause.
+  // Condition tree: AND binds tighter than OR; parentheses group explicitly.
+  // A plain AND chain stays `{ conditions: [...] }` so simple WHERE clauses keep
+  // their original shape.
+  const parseConditionPrimary = () => {
+    if (isPunct(peek(), '(')) {
+      expect(null, '(');
+      const inner = parseOrChain();
+      expect(null, ')');
+      return inner;
+    }
+    return parseComparison();
+  };
+
+  const parseAndChain = () => {
+    const conditions = [parseConditionPrimary()];
+    while (isKeyword(peek(), 'AND')) {
+      expect('AND');
+      conditions.push(parseConditionPrimary());
+    }
+    return { conditions };
+  };
+
+  const parseOrChain = () => {
+    const conditions = [parseAndChain()];
+    while (isKeyword(peek(), 'OR')) {
+      expect('OR');
+      conditions.push(parseAndChain());
+    }
+    return conditions.length === 1 ? conditions[0] : { op: 'or', conditions };
+  };
+
+  // Optional `WHERE ...` clause.
   const parseWhere = () => {
     if (!isKeyword(peek(), 'WHERE')) return null;
     expect('WHERE');
-    const conditions = [parseCondition()];
-    while (isKeyword(peek(), 'AND')) {
-      expect('AND');
-      conditions.push(parseCondition());
-    }
-    return { conditions };
+    return parseOrChain();
   };
 
   const parseUpdate = () => {
@@ -173,6 +295,76 @@ export function parse(sql) {
     return { type: 'delete', table, where };
   };
 
+  // ALTER TABLE t ADD [COLUMN] c TYPE [NOT NULL] [DEFAULT literal]
+  // ALTER TABLE t RENAME TO t2
+  // ALTER TABLE t RENAME [COLUMN] a TO b
+  // ALTER TABLE t DROP [COLUMN] c
+  const parseAlter = () => {
+    expect('ALTER');
+    expect('TABLE');
+    const table = ident();
+    if (isKeyword(peek(), 'RENAME')) {
+      expect('RENAME');
+      if (isKeyword(peek(), 'TO')) {
+        expect('TO');
+        return { type: 'alterRenameTable', table, to: ident() };
+      }
+      if (isKeyword(peek(), 'COLUMN')) expect('COLUMN');
+      const from = ident();
+      expect('TO');
+      return { type: 'alterRenameColumn', table, from, to: ident() };
+    }
+    if (isKeyword(peek(), 'DROP')) {
+      expect('DROP');
+      if (isKeyword(peek(), 'COLUMN')) expect('COLUMN');
+      return { type: 'alterDropColumn', table, column: ident() };
+    }
+    expect('ADD');
+    if (isKeyword(peek(), 'COLUMN')) expect('COLUMN');
+    const column = parseColumnDef();
+    if (column.isKey) throw new Error('parse: ALTER TABLE cannot add a PRIMARY KEY column');
+    return { type: 'alterTable', table, column };
+  };
+
+  // TRUNCATE TABLE t — same effect as deleting every row.
+  const parseTruncate = () => {
+    expect('TRUNCATE');
+    expect('TABLE');
+    return { type: 'truncate', table: ident() };
+  };
+
+  // DROP TABLE [IF EXISTS] name  /  DROP INDEX [IF EXISTS] name [ON table]
+  const parseDrop = () => {
+    expect('DROP');
+    if (isKeyword(peek(), 'TABLE')) {
+      expect('TABLE');
+      let ifExists = false;
+      if (isKeyword(peek(), 'IF')) {
+        expect('IF');
+        expect('EXISTS');
+        ifExists = true;
+      }
+      return { type: 'dropTable', table: ident(), ifExists };
+    }
+    if (isKeyword(peek(), 'INDEX')) {
+      expect('INDEX');
+      let ifExists = false;
+      if (isKeyword(peek(), 'IF')) {
+        expect('IF');
+        expect('EXISTS');
+        ifExists = true;
+      }
+      const name = ident();
+      let table = null;
+      if (isKeyword(peek(), 'ON')) {
+        expect('ON');
+        table = ident();
+      }
+      return { type: 'dropIndex', name, table, ifExists };
+    }
+    throw new Error(`parse: expected TABLE or INDEX after DROP`);
+  };
+
   const parseAlias = () => {
     if (isKeyword(peek(), 'AS')) {
       expect('AS');
@@ -181,8 +373,9 @@ export function parse(sql) {
     return null;
   };
 
-  // SELECT item: `col`, `col AS alias`, `*`, `t.*`, or a function call `F(*)` / `F(col)`.
-  const parseSelectItem = () => {
+  // SELECT item primary: `col`, `t.*`, `*`, a literal, or a function call
+  // `F(*)` / `F(arg)` / `F(DISTINCT arg)` where arg may be an expression.
+  const parseSelectPrimary = () => {
     const t = next();
     if (t.kind === 'punct' && t.value === '*') return { kind: 'col', name: '*', alias: null };
     if (t.kind === 'word') {
@@ -195,15 +388,56 @@ export function parse(sql) {
       if (p2 && p2.kind === 'punct' && p2.value === '(') {
         // Function call.
         expect(null, '(');
-        let col = null;
-        if (isPunct(peek(), '*')) expect(null, '*');
-        else col = ident();
+        let distinct = false;
+        if (isKeyword(peek(), 'DISTINCT')) {
+          expect('DISTINCT');
+          distinct = true;
+        }
+        let arg = null;
+        if (isPunct(peek(), '*')) {
+          expect(null, '*');
+          if (distinct) throw new Error(`parse: ${t.value.toUpperCase()}(DISTINCT *) is not valid`);
+        } else arg = parseArithExpr();
         expect(null, ')');
-        return { kind: 'agg', fn: t.value.toLowerCase(), col, alias: parseAlias() };
+        return { kind: 'agg', fn: t.value.toLowerCase(), arg, distinct, alias: parseAlias() };
       }
       return { kind: 'col', name: t.value, alias: parseAlias() };
     }
-    throw new Error(`parse: expected column or function, got '${t?.value ?? 'EOF'}'`);
+    if (t.kind === 'num' || t.kind === 'str') return { kind: 'lit', value: t.kind === 'num' ? Number(t.value) : t.value, alias: parseAlias() };
+    throw new Error(`parse: expected column, function or literal, got '${t?.value ?? 'EOF'}'`);
+  };
+
+  const parseArithOperand = () => {
+    const t = peek();
+    if (t && t.kind === 'word') {
+      next();
+      return { kind: 'col', name: t.value };
+    }
+    return { kind: 'lit', value: literal() };
+  };
+
+  // Left-associative arithmetic over column names and literals.
+  // `first` (when given) is already-parsed, so it can seed the chain.
+  const parseArithExpr = (first = null) => {
+    let expr = first ?? parseArithOperand();
+    for (;;) {
+      const t = peek();
+      if (!isPunct(t, '+') && !isPunct(t, '-') && !isPunct(t, '*') && !isPunct(t, '/') && !isPunct(t, '||')) break;
+      next();
+      expr = { kind: 'expr', op: t.value, left: expr, right: parseArithOperand() };
+    }
+    return expr;
+  };
+
+  // SELECT item: `col`, `col AS alias`, `col + 1`, `100 - price`, `*`,
+  // or a function call. Arithmetic only combines columns / literals.
+  const parseSelectItem = () => {
+    const first = parseSelectPrimary();
+    if ((first.kind === 'col' || first.kind === 'lit') && !first.alias && !first.name?.endsWith('*')) {
+      const expr = parseArithExpr(first);
+      if (expr.kind === 'expr') return { kind: 'expr', expr, alias: parseAlias() };
+    }
+    return first;
   };
 
   const parseGroupBy = () => {
@@ -221,7 +455,7 @@ export function parse(sql) {
   const parseHaving = () => {
     if (!isKeyword(peek(), 'HAVING')) return null;
     expect('HAVING');
-    return parseCondition();
+    return parseOrChain();
   };
 
   const parseOrderBy = () => {
@@ -245,7 +479,7 @@ export function parse(sql) {
   };
 
   // Words that terminate a table reference (so they are not eaten as an alias).
-  const NOT_AN_ALIAS = new Set(['WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'ON', 'GROUP', 'ORDER', 'HAVING', 'AS', 'LIMIT', 'UNION']);
+  const NOT_AN_ALIAS = new Set(['WHERE', 'JOIN', 'INNER', 'LEFT', 'RIGHT', 'FULL', 'OUTER', 'CROSS', 'ON', 'GROUP', 'ORDER', 'HAVING', 'AS', 'LIMIT', 'UNION', 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER']);
 
   const parseTableRef = () => {
     const table = ident();
@@ -303,7 +537,9 @@ export function parse(sql) {
     return { from, joins };
   };
 
-  const parseSelect = () => {
+  // SELECT core: everything before ORDER BY / LIMIT, so a UNION chain can put
+  // one trailing ORDER BY / LIMIT on the combined result.
+  const parseSelectCore = () => {
     expect('SELECT');
     let distinct = false;
     if (isKeyword(peek(), 'DISTINCT')) {
@@ -329,8 +565,11 @@ export function parse(sql) {
     const where = parseWhere();
     const groupBy = parseGroupBy();
     const having = parseHaving();
+    return { type: 'select', table: from.table, from, joins, distinct, selectItems, where, groupBy, having, orderBy: null, orderByKeys: null, limit: null, offset: 0 };
+  };
+
+  const parseSelectTail = () => {
     const orderByKeys = parseOrderBy();
-    const orderBy = orderByKeys ? orderByKeys[0] : null;
     let limit = null;
     let offset = 0;
     if (isKeyword(peek(), 'LIMIT')) {
@@ -340,16 +579,55 @@ export function parse(sql) {
         expect('OFFSET');
         offset = literal();
       }
+    } else if (isKeyword(peek(), 'OFFSET')) {
+      // OFFSET without LIMIT is allowed (skip N, return the rest).
+      expect('OFFSET');
+      offset = literal();
     }
     if (typeof limit === 'number' && (!Number.isInteger(limit) || limit < 0)) throw new Error('parse: LIMIT must be a non-negative integer');
-    return { type: 'select', table: from.table, from, joins, distinct, selectItems, where, groupBy, having, orderBy, orderByKeys, limit, offset };
+    if (typeof offset === 'number' && (!Number.isInteger(offset) || offset < 0)) throw new Error('parse: OFFSET must be a non-negative integer');
+    return { orderByKeys, orderBy: orderByKeys ? orderByKeys[0] : null, limit, offset };
   };
 
+  /**
+   * SELECT [UNION [ALL] SELECT ...] [ORDER BY ...] [LIMIT ...]
+   * One SELECT keeps the flat AST; a chain becomes
+   * { type:'union', branches, all (one flag per UNION), orderByKeys, limit, offset }.
+   */
+  const parseQuery = () => {
+    const branches = [parseSelectCore()];
+    const all = [];
+    while (isKeyword(peek(), 'UNION')) {
+      expect('UNION');
+      let keep = false;
+      if (isKeyword(peek(), 'ALL')) {
+        expect('ALL');
+        keep = true;
+      }
+      all.push(keep);
+      branches.push(parseSelectCore());
+    }
+    const tail = parseSelectTail();
+    if (branches.length === 1) return { ...branches[0], ...tail };
+    return { type: 'union', branches, all, ...tail };
+  };
+
+  let ast;
   const t = peek();
-  if (isWord(t, 'CREATE')) return parseCreate();
-  if (isWord(t, 'INSERT')) return parseInsert();
-  if (isWord(t, 'UPDATE')) return parseUpdate();
-  if (isWord(t, 'DELETE')) return parseDelete();
-  if (isWord(t, 'SELECT')) return parseSelect();
-  throw new Error(`parse: unsupported statement '${t?.value ?? 'EOF'}'`);
+  if (isWord(t, 'CREATE')) ast = parseCreate();
+  else if (isWord(t, 'INSERT')) ast = parseInsert();
+  else if (isWord(t, 'UPDATE')) ast = parseUpdate();
+  else if (isWord(t, 'DELETE')) ast = parseDelete();
+  else if (isWord(t, 'TRUNCATE')) ast = parseTruncate();
+  else if (isWord(t, 'DROP')) ast = parseDrop();
+  else if (isWord(t, 'ALTER')) ast = parseAlter();
+  else if (isWord(t, 'SELECT')) ast = parseQuery();
+  else throw new Error(`parse: unsupported statement '${t?.value ?? 'EOF'}'`);
+
+  // A single statement runs to EOF; an optional ';' is allowed. Anything else
+  // is a real syntax error rather than silently ignored input.
+  if (isPunct(peek(), ';')) next();
+  const trailing = peek();
+  if (trailing && trailing.kind !== 'eof') throw new Error(`parse: unexpected trailing input '${trailing.value}'`);
+  return ast;
 }

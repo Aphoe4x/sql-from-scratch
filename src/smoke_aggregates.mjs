@@ -81,4 +81,38 @@ r = db.execSql('SELECT DISTINCT city FROM sales ORDER BY city LIMIT 2');
 if (JSON.stringify(r.rows.map((x) => x.city)) !== JSON.stringify(['Abuja', 'Ibadan'])) throw new Error(`DISTINCT + LIMIT: ${JSON.stringify(r.rows)}`);
 console.log('distinct ok');
 
+// 12. COUNT/SUM/AVG/MIN/MAX(DISTINCT col) deduplicate inputs first.
+r = db.execSql('SELECT COUNT(DISTINCT city), COUNT(DISTINCT status) FROM sales');
+if (JSON.stringify(r.rows[0]) !== JSON.stringify({ 'count(DISTINCT city)': 4, 'count(DISTINCT status)': 2 })) {
+  throw new Error(`COUNT(DISTINCT): ${JSON.stringify(r.rows[0])}`);
+}
+r = db.execSql('SELECT COUNT(DISTINCT amount) AS n FROM sales');
+if (r.rows[0].n !== 20) throw new Error(`COUNT(DISTINCT amount): ${JSON.stringify(r.rows[0])}`);
+r = db.execSql('SELECT SUM(DISTINCT amount), AVG(DISTINCT amount), MIN(DISTINCT amount), MAX(DISTINCT amount) FROM sales');
+const d = r.rows[0];
+if (d['sum(DISTINCT amount)'] !== 2100 || d['avg(DISTINCT amount)'] !== 105 || d['min(DISTINCT amount)'] !== 10 || d['max(DISTINCT amount)'] !== 200) {
+  throw new Error(`DISTINCT aggregates: ${JSON.stringify(d)}`);
+}
+r = db.execSql('SELECT city, COUNT(DISTINCT amount) AS s FROM sales GROUP BY city ORDER BY city');
+if (!r.rows.every((row) => row.s === 5)) throw new Error(`grouped COUNT(DISTINCT): ${JSON.stringify(r.rows)}`);
+
+db.execSql('CREATE TABLE nums (id INTEGER PRIMARY KEY, g TEXT, v INTEGER)');
+db.execSql("INSERT INTO nums (g, v) VALUES ('a', 5), ('a', 5), ('a', 7), ('b', 7), ('b', 9)");
+r = db.execSql('SELECT COUNT(v), COUNT(DISTINCT v), SUM(v), SUM(DISTINCT v), AVG(DISTINCT v) FROM nums');
+if (JSON.stringify(r.rows[0]) !== JSON.stringify({ 'count(v)': 5, 'count(DISTINCT v)': 3, 'sum(v)': 33, 'sum(DISTINCT v)': 21, 'avg(DISTINCT v)': 7 })) {
+  throw new Error(`DISTINCT over duplicates: ${JSON.stringify(r.rows[0])}`);
+}
+r = db.execSql('SELECT g, COUNT(DISTINCT v) AS n FROM nums GROUP BY g ORDER BY g');
+if (JSON.stringify(r.rows.map((x) => [x.g, x.n])) !== JSON.stringify([['a', 2], ['b', 2]])) throw new Error(`grouped DISTINCT: ${JSON.stringify(r.rows)}`);
+r = db.execSql('SELECT g, COUNT(DISTINCT v) AS n FROM nums GROUP BY g HAVING n = 2 ORDER BY g');
+if (r.rows.length !== 2) throw new Error(`HAVING on COUNT(DISTINCT): ${JSON.stringify(r.rows)}`);
+let threw = false;
+try {
+  db.execSql('SELECT COUNT(DISTINCT *) FROM nums');
+} catch {
+  threw = true;
+}
+if (!threw) throw new Error('COUNT(DISTINCT *) should be rejected');
+console.log('distinct aggregates ok:', JSON.stringify(db.execSql('SELECT COUNT(DISTINCT v), SUM(DISTINCT v) FROM nums').rows[0]));
+
 console.log('aggregates smoke OK');

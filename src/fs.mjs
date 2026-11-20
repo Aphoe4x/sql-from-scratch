@@ -12,7 +12,7 @@ export const LEAF = 1;
 const CRC_OFF = PAGE_SIZE - 4;
 
 const MAGIC = 0x535144; // "SQD"
-const VERSION = 3; // v3: page checksums + freelist in the meta page; v1/v2 files still open
+const VERSION = 4; // v4: NOT NULL / DEFAULT per column, UNIQUE flag per index; v1-v3 still open
 
 /** Zero the checksum field, then store the CRC of the whole page. */
 function stampCrc(buf) {
@@ -159,6 +159,25 @@ export class FileManager {
         off += 1;
         buf[off] = c.isKey ? 1 : 0;
         off += 1;
+        const hasDefault = c.defaultValue !== undefined && c.defaultValue !== null;
+        buf[off] = (c.notNull ? 1 : 0) | (hasDefault ? 2 : 0);
+        off += 1;
+        if (hasDefault) {
+          if (typeof c.defaultValue === 'number') {
+            buf[off] = 0;
+            off += 1;
+            buf.writeDoubleLE(c.defaultValue, off);
+            off += 8;
+          } else {
+            buf[off] = 1;
+            off += 1;
+            const dv = Buffer.from(String(c.defaultValue), 'utf8');
+            buf.writeUInt16LE(dv.length, off);
+            off += 2;
+            dv.copy(buf, off);
+            off += dv.length;
+          }
+        }
       }
       buf.writeUInt32LE(t.rootPage, off);
       off += 4;
@@ -178,6 +197,8 @@ export class FileManager {
         off += ix.column.length;
         buf.writeUInt32LE(ix.rootPage, off);
         off += 4;
+        buf[off] = ix.unique ? 1 : 0;
+        off += 1;
       }
     }
     // v3: freelist of page numbers available for reuse.
@@ -224,7 +245,28 @@ export class FileManager {
         off += 1;
         const isKey = buf[off] === 1;
         off += 1;
-        columns.push({ name: cname, type, isKey });
+        // v4 adds NOT NULL / DEFAULT.
+        let notNull = false;
+        let defaultValue;
+        if (version >= 4) {
+          const flags = buf[off];
+          off += 1;
+          notNull = (flags & 1) === 1;
+          if (flags & 2) {
+            const dtype = buf[off];
+            off += 1;
+            if (dtype === 0) {
+              defaultValue = buf.readDoubleLE(off);
+              off += 8;
+            } else {
+              const len = buf.readUInt16LE(off);
+              off += 2;
+              defaultValue = buf.slice(off, off + len).toString('utf8');
+              off += len;
+            }
+          }
+        }
+        columns.push({ name: cname, type, isKey, notNull, defaultValue });
       }
       const rootPage = buf.readUInt32LE(off);
       off += 4;
@@ -246,7 +288,9 @@ export class FileManager {
           off += colLen;
           const ixRoot = buf.readUInt32LE(off);
           off += 4;
-          indexes.push({ name: ixName, column, rootPage: ixRoot });
+          const unique = version >= 4 ? buf[off] === 1 : false;
+          if (version >= 4) off += 1;
+          indexes.push({ name: ixName, column, rootPage: ixRoot, unique });
         }
       }
       this.tables.push({ name, columns, rootPage, nextId, indexes });
