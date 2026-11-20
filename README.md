@@ -2,6 +2,21 @@
 
 A SQL database written from scratch — no dependencies, no external services, running on plain Node.js.
 
+## Test it in 5 minutes
+
+```
+git clone https://github.com/Aphoe4x/sql-from-scratch
+cd sql-from-scratch
+npm i            # no dependencies, Node.js 24+ required
+npm test         # all 22 smoke suites pass (engine, DML, aggregates, joins, ...)
+npm run demo     # seeds 1000 users, runs 3 SELECTs with planner output
+npm run cli      # interactive shell — try `SELECT amount * 2 FROM users LIMIT 3;`
+```
+
+Everything runs offline. To poke at the engine yourself: `node src/smoke_vacuum.mjs`, or type SQL in `npm run cli` (`.schema`, `.tables`, `VACUUM`, `ALTER TABLE ... RENAME`, ...).
+
+## Quick start
+
 ```
 npm run cli               # interactive SQL shell (creates ./cli.db)
 npm run demo              # seed 1000 users + 3 SELECT queries with planner output
