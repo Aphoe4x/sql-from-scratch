@@ -333,6 +333,12 @@ export function parse(sql) {
     return { type: 'truncate', table: ident() };
   };
 
+  // VACUUM — rebuild every table/index so the freelist is empty.
+  const parseVacuum = () => {
+    expect('VACUUM');
+    return { type: 'vacuum' };
+  };
+
   // DROP TABLE [IF EXISTS] name  /  DROP INDEX [IF EXISTS] name [ON table]
   const parseDrop = () => {
     expect('DROP');
@@ -619,6 +625,7 @@ export function parse(sql) {
   else if (isWord(t, 'UPDATE')) ast = parseUpdate();
   else if (isWord(t, 'DELETE')) ast = parseDelete();
   else if (isWord(t, 'TRUNCATE')) ast = parseTruncate();
+  else if (isWord(t, 'VACUUM')) ast = parseVacuum();
   else if (isWord(t, 'DROP')) ast = parseDrop();
   else if (isWord(t, 'ALTER')) ast = parseAlter();
   else if (isWord(t, 'SELECT')) ast = parseQuery();

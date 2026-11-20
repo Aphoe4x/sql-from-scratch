@@ -1146,6 +1146,10 @@ export class Database {
       this.commit();
       return { rows: [], columns: [], plan: null, table: truncated.table, truncated: truncated.truncated, pages: truncated.pages };
     }
+    if (ast.type === 'vacuum') {
+      const v = this.vacuum();
+      return { rows: [], columns: [], plan: null, ...v };
+    }
     if (ast.type === 'dropTable') {
       const dropped = this.dropTable(ast.table, ast.ifExists);
       this.commit();
@@ -1307,6 +1311,39 @@ export class Database {
       ix.rootPage = ixRoot;
     }
     return { table: tableName, truncated: rows, pages };
+  }
+
+  /**
+   * VACUUM — rebuild every table and its secondary indexes in place so the
+   * database has no freelist gaps: all tree pages are freed and reinserted,
+   * then the freelist is emptied and committed with the meta page.
+   */
+  vacuum() {
+    for (const table of this.tables.values()) {
+      const rows = [...table.bt.scan(null)].map((e) => ({ key: e.key, blob: e.value }));
+      for (const p of table.bt.pages()) this.fm.freePage(p);
+      const newRoot = this.fm.allocatePage();
+      this.fm.writePage(newRoot, serializeLeaf({ type: LEAF, pageNum: newRoot, entries: [] }));
+      table.bt = new BTree(this.fm, newRoot);
+      table.rootPage = newRoot;
+      for (const ix of table.indexes) {
+        for (const p of ix.bt.pages()) this.fm.freePage(p);
+        const ixRoot = this.fm.allocatePage();
+        this.fm.writePage(ixRoot, serializeLeaf({ type: LEAF, pageNum: ixRoot, entries: [] }));
+        ix.bt = new BTree(this.fm, ixRoot);
+        ix.rootPage = ixRoot;
+      }
+      for (const { key, blob } of rows) {
+        table.bt.insert(key, blob);
+        for (const ix of table.indexes) this.indexAdd(ix, this.queryRow(table, key, blob)[ix.column], key);
+      }
+      table.rootPage = table.bt.rootPage;
+      for (const ix of table.indexes) ix.rootPage = ix.bt.rootPage;
+    }
+    // All freed pages were reused by the new roots; drop whatever is left.
+    this.fm.freeList = [];
+    this.commit();
+    return { vacuumed: true, tables: this.tables.size };
   }
 
   begin() {

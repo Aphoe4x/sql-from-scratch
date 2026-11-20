@@ -29,6 +29,7 @@ node src/smoke_where_or.mjs # OR logic, parentheses, precedence, OR in HAVING/DM
 node src/smoke_ctas.mjs # CREATE TABLE name AS SELECT (type inference, keys, IF NOT EXISTS)
 node src/smoke_truncate.mjs # TRUNCATE TABLE: page-freeing reset, index cleared, reopen
 node src/smoke_select_expr.mjs # SELECT expressions: arithmetic (+ - * / ||), aliases, validation
+node src/smoke_vacuum.mjs # VACUUM: freelist emptied, rows + UNIQUE index survive
 ```
 
 ## Try it in a shell
@@ -63,7 +64,7 @@ Piped input works too: `echo "SELECT COUNT(*) FROM users;" | node src/cli.mjs de
 | `src/lexer.mjs` / `src/parser.mjs` | SQL lexer + parser for the subset below. |
 | `src/planner.mjs` | Static planner with real cost estimates (pages, rows, comparisons); knows full-scan, index-seek, nested-loop-join, index-nested-loop-join and union. |
 | DML | `INSERT ... VALUES (...), (...)` (single statement), `INSERT INTO t (cols) SELECT ...`, `UPDATE t SET col = v [WHERE c = v]` · `DELETE FROM t [WHERE c = v]` |
-| DDL | `CREATE TABLE [IF NOT EXISTS] [col defs | AS SELECT]`, `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`, `ALTER TABLE ... ADD COLUMN / RENAME TO / RENAME COLUMN / DROP COLUMN`, `DROP TABLE [IF EXISTS]`, `DROP INDEX [IF EXISTS] name [ON table]`, `TRUNCATE TABLE name` |
+| DDL | `CREATE TABLE [IF NOT EXISTS] [col defs | AS SELECT]`, `CREATE [UNIQUE] INDEX [IF NOT EXISTS]`, `ALTER TABLE ... ADD COLUMN / RENAME TO / RENAME COLUMN / DROP COLUMN`, `DROP TABLE [IF EXISTS]`, `DROP INDEX [IF EXISTS] name [ON table]`, `TRUNCATE TABLE name`, `VACUUM` |
 | Joins | `INNER` / `LEFT` / comma cross joins, aliases, qualified columns, joins + GROUP BY; the inner side is probed through its key/secondary index when the `ON` equality allows it |
 | Aggregates | `COUNT(*)`, `COUNT(col)`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`; every function also accepts `DISTINCT` (e.g. `COUNT(DISTINCT city)`) and an expression argument (e.g. `SUM(amount * 2)`) |
 | Expressions | `+ - * /` and `\|\|` (concatenation) in SELECT items, e.g. `SELECT amount * 2 AS double FROM sales`; aliases are usable in `ORDER BY` |
@@ -142,6 +143,7 @@ DROP TABLE IF EXISTS accounts
 CREATE TABLE IF NOT EXISTS staging (id INTEGER PRIMARY KEY, src TEXT)
 CREATE TABLE lagos AS SELECT id, name, city FROM users WHERE city = 'Lagos'
 TRUNCATE TABLE lagos                                   -- page-freeing reset; row ids continue
+VACUUM                                                -- rebuild all trees, clear the freelist
 SELECT id FROM users WHERE name = 'user-5'      -- planner: secondary-index-seek
 SELECT id FROM users ORDER BY id ASC LIMIT 5 OFFSET 10
 SELECT id FROM users ORDER BY id OFFSET 990      -- OFFSET without LIMIT
@@ -224,5 +226,5 @@ A crash before step 1 discards everything; a crash after it replays the committe
 - No CHECK constraints, foreign keys, or NULLs (use `''`/0; `NOT NULL` therefore guards omitted values).
 - Values fit in `text`/`double` encodings; no dates/blobs/NULLs (use `''`/0).
 - The freelist lives in the meta page, so it holds a few hundred entries; beyond that (a single huge purge) freed pages are simply not recorded until there is room.
-- No page compaction/vacuum beyond the freelist; the WAL is checkpointed (truncated) on every commit rather than kept for point-in-time recovery.
+- `VACUUM` rebuilds every table and secondary index in place and empties the freelist; there is no page-compaction/vacuum beyond this (e.g. nothing that rewrites the file to remove trailing unused space). The WAL is checkpointed (truncated) on every commit rather than kept for point-in-time recovery.
 - The engine is a library + CLI demos; deployment isn't the point — the point is "shipped a working storage engine from scratch".

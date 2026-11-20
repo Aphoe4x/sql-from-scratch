@@ -6,7 +6,7 @@
   "scripts": {
     "demo": "node src/main.mjs",
     "crashtest": "node src/crashtest.mjs",
-    "test": "node src/smoke_fs.mjs && node src/smoke_btree.mjs && node src/smoke_engine.mjs && node src/smoke_dml.mjs && node src/smoke_aggregates.mjs && node src/smoke_joins.mjs && node src/smoke_indexes.mjs && node src/smoke_cli.mjs && node src/smoke_freelist.mjs && node src/smoke_constraints.mjs && node src/smoke_union.mjs && node src/smoke_ddl.mjs && node src/smoke_alter.mjs && node src/smoke_join_index.mjs && node src/smoke_like.mjs && node src/smoke_insert_select.mjs && node src/smoke_rename.mjs && node src/smoke_where_or.mjs && node src/smoke_ctas.mjs && node src/smoke_truncate.mjs && node src/smoke_select_expr.mjs",
+    "test": "node src/smoke_fs.mjs && node src/smoke_btree.mjs && node src/smoke_engine.mjs && node src/smoke_dml.mjs && node src/smoke_aggregates.mjs && node src/smoke_joins.mjs && node src/smoke_indexes.mjs && node src/smoke_cli.mjs && node src/smoke_freelist.mjs && node src/smoke_constraints.mjs && node src/smoke_union.mjs && node src/smoke_ddl.mjs && node src/smoke_alter.mjs && node src/smoke_join_index.mjs && node src/smoke_like.mjs && node src/smoke_insert_select.mjs && node src/smoke_rename.mjs && node src/smoke_where_or.mjs && node src/smoke_ctas.mjs && node src/smoke_truncate.mjs && node src/smoke_select_expr.mjs && node src/smoke_vacuum.mjs",
     "crashtest2": "node src/crashtest2.mjs",
     "cli": "node src/cli.mjs"
   },

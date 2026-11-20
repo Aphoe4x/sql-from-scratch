@@ -56,6 +56,8 @@ function run(sql) {
       console.log(`dropped column ${res.droppedColumn} (${res.rows} row(s) rewritten${also})`);
     } else if (res.truncated !== undefined) {
       console.log(`truncated ${res.table} (${res.truncated} row(s) removed, ${res.pages} page(s) freed)`);
+    } else if (res.vacuumed) {
+      console.log(`vacuumed (${res.tables} table(s), freelist emptied)`);
     } else if (res.renamed !== undefined && res.to !== undefined) {
       console.log(res.renamed ? `renamed column ${res.from} to ${res.to} on ${res.table}` : `column ${res.to} already named that`);
     } else if (res.renamed !== undefined) {
