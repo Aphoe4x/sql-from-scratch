@@ -142,7 +142,7 @@ SQL: SELECT name FROM users ORDER BY id DESC
   plan: full-scan — est. 20 page(s), est. 1000 row(s)
   result: 1000 row(s), first: {"name":"user-1000"}
       </pre>
-      <img src="screenshot.png" alt="CLI demo output showing the planner's page and row estimates">
+      <p class="out">(The terminal above shows the real output of <code>npm run demo</code> against a 1000-row table: the planner prints page and row estimates for each query.)</p>
     </div>
   </section>
 
