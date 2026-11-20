@@ -13,6 +13,8 @@ npm run demo     # seeds 1000 users, runs 3 SELECTs with planner output
 npm run cli      # interactive shell — try `SELECT amount * 2 FROM users LIMIT 3;`
 ```
 
+**Live demo:** https://aphoe4x.github.io/sql-from-scratch/ — the GitHub Pages landing page for the repo: what the engine is, the same try-it commands, and the real `npm run demo` output.
+
 Everything runs offline. To poke at the engine yourself: `node src/smoke_vacuum.mjs`, or type SQL in `npm run cli` (`.schema`, `.tables`, `VACUUM`, `ALTER TABLE ... RENAME`, ...).
 
 ## Quick start
