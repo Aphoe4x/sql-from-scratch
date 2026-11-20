@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sql-from-scratch — a SQL database written from scratch</title>
+<meta name="description" content="A SQL database written from scratch in Node.js: lexer, parser, B-tree storage, planner, WAL. No dependencies, no external services. Run npm test to try it.">
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  line-height: 1.6;
+}
+header {
+  padding: 2.5rem 1.25rem 1.25rem;
+  text-align: center;
+}
+h1 { margin: 0 0 0.4rem; font-size: 2.4rem; letter-spacing: -0.02em; }
+.tagline { margin: 0 0 2rem; color: #8b949e; font-size: 1.15rem; }
+main { max-width: 880px; margin: 0 auto; padding: 0 1.25rem 3rem; }
+section { margin: 0 0 2.5rem; }
+h2 { font-size: 1.5rem; border-bottom: 1px solid #21262d; padding-bottom: 0.45rem; margin: 0 0 1rem; }
+h3 { font-size: 1.1rem; margin: 0 0 0.6rem; }
+ul { padding-left: 1.3rem; }
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+}
+pre {
+  background: #161b22;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 0.9rem 1.1rem;
+  overflow-x: auto;
+  color: #e6edf3;
+}
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 0.8rem; }
+.card {
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 0.9rem 1.1rem;
+  background: #161b22;
+}
+.card h3 { font-size: 1rem; margin: 0 0 0.4rem; color: #e6edf3; }
+.card p { margin: 0; color: #8b949e; font-size: 0.9rem; }
+.demo-terminal {
+  background: #0a0e14;
+  border: 1px solid #21262d;
+  border-radius: 8px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+.demo-terminal pre { background: none; border: none; padding: 0; font-size: 0.85rem; color: #c9d1d9; }
+.demo-terminal .prompt { color: #7ee787; }
+.demo-terminal .out { color: #8b949e; }
+img { max-width: 100%; height: auto; border: 1px solid #21262d; border-radius: 8px; }
+footer {
+  border-top: 1px solid #21262d;
+  text-align: center;
+  padding: 1.4rem;
+  color: #8b949e;
+  font-size: 0.9rem;
+}
+footer a { color: #58a6ff; }
+a { color: #58a6ff; text-decoration: none; }
+@media (prefers-color-scheme: light) {
+  body { background: #ffffff; color: #1f2328; }
+  .tagline, .card p, .demo-terminal .out, footer, ul { color: #57606a; }
+  .card { background: #f6f8fa; border-color: #d0d7de; }
+  pre, .demo-terminal { background: #f6f8fa; border-color: #d0d7de; }
+  h2 { border-color: #d0d7de; }
+  header .tagline, footer, .card p { color: #57606a; }
+  h1 { color: #1f2328; }
+  a { color: #0969da; }
+  body a:hover { color: #0550ae; }
+}
+.container { max-width: 880px; margin: 0 auto; padding: 0 1.25rem; }
+.eyebrow { color: #8b949e; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 0.5rem; }
+.stats { display: flex; flex-wrap: wrap; gap: 0.8rem; margin: 0; }
+.stats li { color: #8b949e; }
+.stats li b { color: #e6edf3; }
+</style>
+</head>
+<body>
+<header>
+  <h1>sql-from-scratch</h1>
+  <p class="tagline">A SQL database written from scratch — no dependencies, no external services, running on plain Node.js.</p>
+</header>
+
+<main>
+  <section class="container">
+    <p>
+      A <b>real storage engine</b> — lexer, parser, B-tree storage, a planner with
+      real cost estimates, a WAL that survives SIGKILL mid-write, and a CLI — all
+      written from zero and runnable on disk today. Nothing is hosted or simulated;
+      the database files are real files on your disk.
+    </p>
+  </section>
+
+  <section>
+    <div class="eyebrow">What it is</div>
+    <div class="cards">
+      <div class="card"><h3>FileManager</h3><p>Real 4096-byte pages on disk, page checksums, page freelist, WAL (write-ahead log) + commit protocol.</p></div>
+      <div class="card"><h3>B-tree</h3><p>Classic bottom-up B-tree over the pages: find, insert, delete, update, scan, stats.</p></div>
+      <div class="card"><h3>SQL engine</h3><p>Facade with execSql/execSelect/execUnion — create, insert (incl. multi-row, INSERT…SELECT), update, delete, DDL, DML.</p></div>
+      <div class="card"><h3>Lexer + parser</h3><p>Hand-written SQL subset parser — WHERE/OR, aggregates, joins, indexes, UNION, LIKE, ALTER TABLE, CREATE TABLE AS SELECT, TRUNCATE, VACUUM.</p></div>
+      <div class="card"><h3>Planner</h3><p>Static planner with real cost estimates: full-scan, index-seek, secondary-index-seek, index-nested-loop-join, union.</p></div>
+      <div class="card"><h3>Smoke tests</h3><p>22 suites covering the engine, DML, aggregates, joins, freelist, crash recovery, and more — all green.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Try it in 5 minutes</div>
+    <pre><span class="prompt">$</span> git clone https://github.com/Aphoe4x/sql-from-scratch
+<span class="prompt">$</span> cd sql-from-scratch
+<span class="prompt">$</span> npm i            # no dependencies, Node.js 24+ required
+<span class="prompt">$</span> npm test         # 22 smoke suites pass
+<span class="prompt">$</span> npm run demo     # seeds 1000 users, runs 3 SELECTs with planner output
+<span class="prompt">$</span> npm run cli      # interactive shell — try `SELECT amount * 2 FROM users LIMIT 3;`</pre>
+  </section>
+
+  <section>
+    <div class="eyebrow">See it run — the demo, live</div>
+    <div class="demo-terminal">
+      <pre>
+Seeded 1000 users into demo.db
+users stats: { pageCount: 20, entryCount: 1000, depth: 1 }
+
+SQL: SELECT * FROM users
+  plan: full-scan — est. 20 page(s), est. 1000 row(s)
+  result: 1000 row(s), first: {"id":1,"name":"user-1"}
+
+SQL: SELECT id, name FROM users WHERE id = 500
+  plan: index-seek — est. 2 page(s), est. 1 row(s)
+  result: 1 row(s), first: {"id":500,"name":"user-500"}
+
+SQL: SELECT name FROM users ORDER BY id DESC
+  plan: full-scan — est. 20 page(s), est. 1000 row(s)
+  result: 1000 row(s), first: {"name":"user-1000"}
+      </pre>
+      <img src="screenshot.png" alt="CLI demo output showing the planner's page and row estimates">
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Recent work (stages 20–33)</div>
+    <ul>
+      <li><b>stages 20–26</b> — NOT NULL / DEFAULT literals / CREATE UNIQUE INDEX / meta v4, UNION, multi-row INSERT, DROP TABLE/INDEX, ALTER TABLE ADD COLUMN, index-nested-loop joins, LIKE.</li>
+      <li><b>stages 27–32</b> — smoke tests: INSERT…SELECT, IF [NOT] EXISTS, OFFSET, COUNT(DISTINCT), RENAME COLUMN/TABLE, DROP COLUMN, CREATE TABLE AS SELECT, TRUNCATE, WHERE OR, SELECT expressions.</li>
+      <li><b>stage 33</b> — VACUUM (page compaction).</li>
+    </ul>
+  </section>
+</main>
+
+<footer>
+  <a href="https://github.com/Aphoe4x/sql-from-scratch">View the repo on GitHub</a> &middot;
+  <a href="https://github.com/Aphoe4x/sql-from-scratch/tree/main">main branch</a>
+</footer>
+</body>
+</html>
